@@ -209,6 +209,95 @@ def test_extract_tool_calls_no_tools(qwen3_tool_parser_parametrized):
     assert extracted_tool_calls.content == model_output
 
 
+def test_extract_json_tool_call_list_required(qwen3_tokenizer, sample_tools):
+    tools = _as_chat_completion_tools(sample_tools)
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(
+        model=MODEL, messages=[], tools=tools, tool_choice="required"
+    )
+    model_output = json.dumps(
+        [
+            {
+                "name": "calculate_area",
+                "parameters": {
+                    "shape": "square",
+                    "dimensions": {"side": 7},
+                    "precision": 2,
+                },
+            }
+        ]
+    )
+
+    extracted_tool_calls = parser.extract_tool_calls(model_output, request=request)
+
+    assert extracted_tool_calls.tools_called
+    assert extracted_tool_calls.content is None
+    assert_tool_calls(
+        extracted_tool_calls.tool_calls,
+        [
+            ToolCall(
+                function=FunctionCall(
+                    name="calculate_area",
+                    arguments=json.dumps(
+                        {
+                            "shape": "square",
+                            "dimensions": {"side": 7},
+                            "precision": 2,
+                        }
+                    ),
+                )
+            )
+        ],
+    )
+
+    auto_request = ChatCompletionRequest(
+        model=MODEL, messages=[], tools=tools, tool_choice="auto"
+    )
+    auto_result = parser.extract_tool_calls(model_output, request=auto_request)
+    assert not auto_result.tools_called
+    assert auto_result.tool_calls == []
+    assert auto_result.content == model_output
+
+
+def test_streaming_json_tool_call_list_required(qwen3_tool_parser, qwen3_tokenizer, sample_tools):
+    tools = _as_chat_completion_tools(sample_tools)
+    request = ChatCompletionRequest(
+        model=MODEL, messages=[], tools=tools, tool_choice="required"
+    )
+    model_output = json.dumps(
+        [
+            {
+                "name": "calculate_area",
+                "parameters": {
+                    "shape": "square",
+                    "dimensions": {"side": 7},
+                    "precision": 2,
+                },
+            }
+        ]
+    )
+
+    deltas = list(
+        stream_delta_message_generator(
+            qwen3_tool_parser,
+            qwen3_tokenizer,
+            model_output,
+            request=request,
+        )
+    )
+
+    assert all(delta.content is None for delta in deltas)
+    tool_deltas = [delta for delta in deltas if delta.tool_calls]
+    assert len(tool_deltas) == 1
+    call = tool_deltas[0].tool_calls[0]
+    assert call.function.name == "calculate_area"
+    assert json.loads(call.function.arguments) == {
+        "shape": "square",
+        "dimensions": {"side": 7},
+        "precision": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ids=[
         "single_tool",

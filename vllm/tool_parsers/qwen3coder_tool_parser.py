@@ -112,6 +112,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_text = ""
         self.json_started = False
         self.json_closed = False
+        self.json_tool_call_sent = False
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
@@ -278,11 +279,132 @@ class Qwen3CoderToolParser(ToolParser):
         ]
         return function_calls
 
+    def _known_tool_names(self) -> set[str]:
+        names: set[str] = set()
+        for tool in self.tools or []:
+            function = getattr(tool, "function", None)
+            if function is None and isinstance(tool, dict):
+                function = tool.get("function")
+            if function is not None:
+                name = getattr(function, "name", None)
+                if name is None and isinstance(function, dict):
+                    name = function.get("name")
+            else:
+                name = getattr(tool, "name", None)
+                if name is None and isinstance(tool, dict):
+                    name = tool.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+        return names
+
+    @staticmethod
+    def _json_arguments_to_string(arguments: Any) -> str | None:
+        if isinstance(arguments, str):
+            stripped = arguments.strip()
+            if not stripped:
+                return "{}"
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return stripped
+            if isinstance(decoded, dict):
+                return json.dumps(decoded, ensure_ascii=False)
+            return stripped
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+        return None
+
+    def _parse_json_tool_calls(
+        self, model_output: str, request: ChatCompletionRequest
+    ) -> list[ToolCall]:
+        """Parse vLLM required-tool JSON/list text emitted by Qwen."""
+        if getattr(request, "tool_choice", None) != "required":
+            return []
+        if not getattr(request, "tools", None):
+            return []
+
+        stripped = model_output.strip()
+        if not stripped:
+            return []
+
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("tool_calls"), list):
+            items = parsed["tool_calls"]
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [parsed]
+
+        known_names = self._known_tool_names()
+        tool_calls: list[ToolCall] = []
+        for item in items:
+            if not isinstance(item, dict):
+                return []
+
+            function = item.get("function") if isinstance(item.get("function"), dict) else item
+            if not isinstance(function, dict):
+                return []
+
+            name = function.get("name") or item.get("name")
+            if not isinstance(name, str) or not name:
+                return []
+            if known_names and name not in known_names:
+                return []
+
+            arguments = (
+                function.get("arguments")
+                if "arguments" in function
+                else function.get("parameters")
+                if "parameters" in function
+                else item.get("arguments")
+                if "arguments" in item
+                else item.get("parameters")
+            )
+            args_json = self._json_arguments_to_string(arguments)
+            if args_json is None:
+                return []
+
+            tool_calls.append(
+                ToolCall(
+                    type="function",
+                    function=FunctionCall(name=name, arguments=args_json),
+                )
+            )
+
+        return tool_calls
+
+    @staticmethod
+    def _should_suppress_json_tool_call_prefix(
+        current_text: str, request: ChatCompletionRequest
+    ) -> bool:
+        if getattr(request, "tool_choice", None) != "required":
+            return False
+        stripped = current_text.lstrip()
+        return stripped.startswith("[") or stripped.startswith("{")
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        json_tool_calls = self._parse_json_tool_calls(model_output, request)
+        if json_tool_calls:
+            self.prev_tool_call_arr.clear()
+            for tool_call in json_tool_calls:
+                self.prev_tool_call_arr.append(
+                    {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    }
+                )
+            return ExtractedToolCallInformation(
+                tools_called=True, tool_calls=json_tool_calls, content=None
+            )
+
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(
@@ -372,6 +494,34 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Update accumulated text
         self.accumulated_text = current_text
+
+        if not self.json_tool_call_sent:
+            json_tool_calls = self._parse_json_tool_calls(current_text, request)
+            if json_tool_calls:
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = []
+                delta_tool_calls = []
+                for index, tool_call in enumerate(json_tool_calls):
+                    args_json = tool_call.function.arguments
+                    self.prev_tool_call_arr.append(
+                        {"name": tool_call.function.name, "arguments": args_json}
+                    )
+                    self.streamed_args_for_tool.append(args_json)
+                    delta_tool_calls.append(
+                        DeltaToolCall(
+                            index=index,
+                            id=self._generate_tool_call_id(),
+                            function=DeltaFunctionCall(
+                                name=tool_call.function.name,
+                                arguments=args_json,
+                            ),
+                            type="function",
+                        )
+                    )
+                self.json_tool_call_sent = True
+                return DeltaMessage(tool_calls=delta_tool_calls)
+            if self._should_suppress_json_tool_call_prefix(current_text, request):
+                return None
 
         # Check if we need to advance to next tool
         if self.json_closed and not self.in_function:
