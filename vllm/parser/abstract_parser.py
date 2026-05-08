@@ -453,10 +453,27 @@ class DelegatingParser(Parser):
             were parsed
         """
         function_calls: list[FunctionCall] = []
+        tool_choice_uses_parser = (
+            self._tool_parser is not None
+            and enable_auto_tools
+            and request.tools
+            and not self._tool_parser.supports_required_and_named
+            and (
+                request.tool_choice == "required"
+                or isinstance(
+                    request.tool_choice,
+                    (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+                )
+            )
+        )
 
-        if request.tool_choice and isinstance(
-            request.tool_choice,
-            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+        if (
+            request.tool_choice
+            and isinstance(
+                request.tool_choice,
+                (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+            )
+            and not tool_choice_uses_parser
         ):
             # Forced Function Call
             assert content is not None
@@ -465,7 +482,7 @@ class DelegatingParser(Parser):
             )
             return function_calls, None  # Clear content since tool is called.
 
-        if request.tool_choice == "required":
+        if request.tool_choice == "required" and not tool_choice_uses_parser:
             # Required tool calls - parse JSON
             tool_calls = []
             with contextlib.suppress(ValidationError):
@@ -485,7 +502,11 @@ class DelegatingParser(Parser):
         if (
             self._tool_parser is not None
             and enable_auto_tools
-            and (request.tool_choice == "auto" or request.tool_choice is None)
+            and (
+                request.tool_choice == "auto"
+                or request.tool_choice is None
+                or tool_choice_uses_parser
+            )
         ):
             # Automatic Tool Call Parsing
             tool_call_info = self._tool_parser.extract_tool_calls(
@@ -586,9 +607,26 @@ class DelegatingParser(Parser):
         tool_call_id_type: str = "random",
         function_name_returned: bool = False,
     ) -> tuple[DeltaMessage | None, bool]:
-        if request.tool_choice and isinstance(
-            request.tool_choice,
-            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+        tool_choice_uses_parser = (
+            self._tool_parser is not None
+            and request.tools
+            and not self._tool_parser.supports_required_and_named
+            and (
+                request.tool_choice == "required"
+                or isinstance(
+                    request.tool_choice,
+                    (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+                )
+            )
+        )
+
+        if (
+            request.tool_choice
+            and isinstance(
+                request.tool_choice,
+                (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+            )
+            and not tool_choice_uses_parser
         ):
             delta_message, function_name_returned = extract_named_tool_call_streaming(
                 delta_text=delta_text,
@@ -600,7 +638,7 @@ class DelegatingParser(Parser):
             )
             return delta_message, function_name_returned
 
-        if request.tool_choice == "required":
+        if request.tool_choice == "required" and not tool_choice_uses_parser:
             delta_message, function_name_returned = (
                 extract_required_tool_call_streaming(
                     previous_text=previous_text,

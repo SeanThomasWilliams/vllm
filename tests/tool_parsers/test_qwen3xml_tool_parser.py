@@ -10,7 +10,13 @@ from tests.tool_parsers.common_tests import (
     ToolParserTestConfig,
     ToolParserTests,
 )
-from vllm.tool_parsers.qwen3xml_tool_parser import StreamingXMLToolCallParser
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.parser.abstract_parser import DelegatingParser
+from vllm.tool_parsers.qwen3xml_tool_parser import (
+    Qwen3XMLToolParser,
+    StreamingXMLToolCallParser,
+)
 
 
 def _parse_full(xml: str) -> dict:
@@ -36,6 +42,116 @@ def _parse_char_by_char(xml: str) -> dict:
     assert result.tool_calls, f"No tool calls parsed from:\n{xml}"
     args_str = result.tool_calls[0].function.arguments
     return json.loads(args_str)
+
+
+class DummyTokenizer:
+    def get_vocab(self):
+        return {}
+
+
+CALCULATOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "calculator",
+        "description": "Evaluate arithmetic expressions.",
+        "parameters": {
+            "type": "object",
+            "properties": {"expression": {"type": "string"}},
+            "required": ["expression"],
+        },
+    },
+}
+
+CALCULATOR_XML = (
+    "<tool_call>\n"
+    "<function=calculator>\n"
+    "<parameter=expression>\n"
+    "7 * 8\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>"
+)
+
+
+class TestRequiredAndNamedToolChoiceFallback:
+    def _request(self, tool_choice):
+        return ChatCompletionRequest(
+            model="test-model",
+            messages=[],
+            tools=[CALCULATOR_TOOL],
+            tool_choice=tool_choice,
+            response_format={"type": "json_object"},
+        )  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["required", {"type": "function", "function": {"name": "calculator"}}],
+    )
+    def test_qwen3xml_required_and_named_skip_guided_json(self, tool_choice):
+        parser = Qwen3XMLToolParser(DummyTokenizer(), [CALCULATOR_TOOL])
+        adjusted = parser.adjust_request(self._request(tool_choice))
+
+        assert adjusted.structured_outputs is None
+        assert adjusted.response_format is None
+        assert adjusted.skip_special_tokens is False
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["required", {"type": "function", "function": {"name": "calculator"}}],
+    )
+    def test_non_streaming_required_and_named_use_qwen3xml_parser(self, tool_choice):
+        request = self._request(tool_choice)
+
+        tool_calls, content = OpenAIServing._parse_tool_calls_from_content(
+            request=request,
+            tokenizer=DummyTokenizer(),
+            enable_auto_tools=True,
+            tool_parser_cls=Qwen3XMLToolParser,
+            content=CALCULATOR_XML,
+        )
+
+        assert content is None
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "calculator"
+        assert json.loads(tool_calls[0].arguments) == {"expression": "7 * 8"}
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["required", {"type": "function", "function": {"name": "calculator"}}],
+    )
+    def test_delegating_parser_required_and_named_use_qwen3xml_parser(
+        self, tool_choice
+    ):
+        parser = DelegatingParser(DummyTokenizer())
+        parser.tool_parser = Qwen3XMLToolParser(DummyTokenizer(), [CALCULATOR_TOOL])
+        request = self._request(tool_choice)
+
+        tool_calls, content = parser._parse_tool_calls(
+            request=request, content=CALCULATOR_XML, enable_auto_tools=True
+        )
+
+        assert content is None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "calculator"
+        assert json.loads(tool_calls[0].arguments) == {"expression": "7 * 8"}
+
+        delta, _ = parser._extract_tool_calls_streaming(
+            previous_text="",
+            current_text=CALCULATOR_XML,
+            delta_text=CALCULATOR_XML,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+
+        assert delta is not None
+        assert delta.tool_calls is not None
+        assert delta.tool_calls[0].function.name == "calculator"
+        assert json.loads(delta.tool_calls[0].function.arguments) == {
+            "expression": "7 * 8"
+        }
 
 
 class TestParamCloseLookahead:

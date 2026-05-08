@@ -7,8 +7,11 @@ from collections.abc import Sequence
 from enum import Enum, auto
 from typing import Optional
 
+from openai.types.responses import ToolChoiceFunction
+
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.engine.protocol import (
@@ -19,6 +22,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
@@ -828,6 +832,8 @@ class StreamingXMLToolCallParser:
 
 
 class Qwen3XMLToolParser(ToolParser):
+    supports_required_and_named = False
+
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         self.parser = StreamingXMLToolCallParser()
@@ -838,6 +844,21 @@ class Qwen3XMLToolParser(ToolParser):
         logger.info(
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if request.tools:
+            tc = request.tool_choice
+            if tc == "required" or isinstance(
+                tc, (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction)
+            ):
+                request.skip_special_tokens = False
+                if isinstance(request, ChatCompletionRequest):
+                    request.structured_outputs = None
+                    request.response_format = None
+                return request
+        return super().adjust_request(request)
 
     def extract_tool_calls(
         self,
