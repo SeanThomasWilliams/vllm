@@ -200,7 +200,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import is_workspace_manager_initialized, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -6104,6 +6104,22 @@ class GPUModelRunner(
 
         return int(total_estimate)
 
+    def _reserve_turboquant_workspaces(self) -> None:
+        if not is_workspace_manager_initialized():
+            return
+
+        for layer in get_layers_from_vllm_config(self.vllm_config, Attention).values():
+            impl = getattr(layer, "impl", None)
+            reserve_workspace_fn = getattr(impl, "reserve_workspace", None)
+            kv_cache = getattr(layer, "kv_cache", None)
+            if callable(reserve_workspace_fn) and isinstance(kv_cache, torch.Tensor):
+                reserve_workspace_fn(
+                    kv_cache,
+                    self.max_num_reqs,
+                    self.max_model_len,
+                    self.dtype,
+                )
+
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -6179,6 +6195,8 @@ class GPUModelRunner(
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+
+        self._reserve_turboquant_workspaces()
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.

@@ -236,6 +236,13 @@ def init_workspace_manager(
     _manager = WorkspaceManager(device, num_ubatches)
 
 
+def reserve_workspace(
+    *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+) -> None:
+    """Reserve workspace by materializing the requested tensor views."""
+    current_workspace_manager().get_simultaneous(*shapes_and_dtypes)
+
+
 def lock_workspace() -> None:
     """Lock the workspace to prevent further growth.
 

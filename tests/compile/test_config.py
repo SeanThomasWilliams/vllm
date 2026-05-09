@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -513,6 +514,28 @@ def test_cudagraph_sizes_post_init(
         ),
     ],
 )
+def test_cudagraph_sizes_filter_speculative_decode_divisibility():
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=16,
+            max_model_len=16,
+            is_encoder_decoder=False,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_capture_sizes=[1, 2, 3, 4, 5, 6, 7, 8],
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+        parallel_config=ParallelConfig(),
+    )
+    vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+
+    vllm_config._set_cudagraph_sizes()
+
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == [4, 8]
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 8
+
+
 def test_sequence_parallelism_requires_full_graph_compilation(
     cudagraph_mode: CUDAGraphMode,
     use_inductor_graph_partition: bool,

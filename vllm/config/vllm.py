@@ -1545,6 +1545,29 @@ class VllmConfig:
                     cudagraph_capture_sizes
                 )
 
+            if self.speculative_config is not None:
+                uniform_q_len = 1 + self.speculative_config.num_speculative_tokens
+                if uniform_q_len > 1:
+                    original_capture_sizes = list(cudagraph_capture_sizes)
+                    cudagraph_capture_sizes = [
+                        size
+                        for size in cudagraph_capture_sizes
+                        if size % uniform_q_len == 0
+                    ]
+                    if uniform_q_len <= max_num_tokens and uniform_q_len not in cudagraph_capture_sizes:
+                        cudagraph_capture_sizes.append(uniform_q_len)
+                    cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
+                    removed_sizes = sorted(
+                        set(original_capture_sizes) - set(cudagraph_capture_sizes)
+                    )
+                    if removed_sizes:
+                        logger.info(
+                            "Filtered cudagraph_capture_sizes for speculative "
+                            "decode (uniform_q_len=%d): removed %s",
+                            uniform_q_len,
+                            removed_sizes,
+                        )
+
             # user-specific compilation_config.max_cudagraph_capture_size get
             # truncated to valid_max_size when they are inconsistent.
             valid_max_size = (
