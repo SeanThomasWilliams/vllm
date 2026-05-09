@@ -133,11 +133,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             tuple[Optional[str], Optional[str]]: reasoning content and content
         """
 
-        # Strip <think> if present in the generated output.
-        model_output_parts = model_output.partition(self.start_token)
-        model_output = (
-            model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
-        )
+        # Strip <think> only when it belongs to the reasoning prefix.  A
+        # literal <think> can appear later in final content (for example inside
+        # a code block documenting forbidden tags) after </think> has already
+        # ended reasoning and must be preserved as content.
+        start_index = model_output.find(self.start_token)
+        end_index = model_output.find(self.end_token)
+        if start_index != -1 and (end_index == -1 or start_index < end_index):
+            model_output = model_output[start_index + len(self.start_token) :]
 
         if self.end_token in model_output:
             reasoning, _, content = model_output.partition(self.end_token)
@@ -178,11 +181,16 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         prompt_is_reasoning_end and routes deltas as content without
         calling this method.
         """
-        # Strip <think> from delta if present (old template / edge case
-        # where the model generates <think> itself).
-        if self.start_token_id in delta_token_ids:
+        # Strip <think> from delta only before reasoning has ended (old
+        # template / edge case where the model generates <think> itself).  Once
+        # </think> is already present, a later <think> is literal final content.
+        if (
+            self.start_token_id in delta_token_ids
+            and self.end_token_id not in previous_token_ids
+        ):
             start_idx = delta_text.find(self.start_token)
-            if start_idx >= 0:
+            end_idx = delta_text.find(self.end_token)
+            if start_idx >= 0 and (end_idx == -1 or start_idx < end_idx):
                 delta_text = delta_text[start_idx + len(self.start_token) :]
 
         if self.end_token_id in delta_token_ids:
