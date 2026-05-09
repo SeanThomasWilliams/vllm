@@ -196,6 +196,21 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: Any,
+        kv_cache_spec: Any,
+    ) -> AttentionCGSupport:
+        # TurboQuant K+1 spec-verify batches need the decode-kernel routing
+        # path at runtime. Until full multi-query capture is proven on
+        # Blackwell, only advertise single-token decode graph support under
+        # speculative decoding so vLLM downgrades spec-verify capture to
+        # PIECEWISE instead of FULL.
+        if vllm_config.speculative_config is not None:
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return cls._cudagraph_support
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
