@@ -59,6 +59,15 @@ WITH_THINK_STREAM = {
     "content": "This is the rest",
 }
 
+LITERAL_THINK_IN_CONTENT = {
+    "output": (
+        'This is reasoning</think>Final code: FORBIDDEN_TAGS = '
+        '("<think>", "</think>")'
+    ),
+    "reasoning": "This is reasoning",
+    "content": 'Final code: FORBIDDEN_TAGS = ("<think>", "</think>")',
+}
+
 # --- No think tokens at all (thinking enabled, truncated) ---
 
 # With thinking enabled (default), no think tokens means the output was
@@ -167,6 +176,16 @@ TEST_CASES = [
         True,
         WITH_THINK_STREAM,
         id="with_think_stream",
+    ),
+    pytest.param(
+        False,
+        LITERAL_THINK_IN_CONTENT,
+        id="literal_think_in_content",
+    ),
+    pytest.param(
+        True,
+        LITERAL_THINK_IN_CONTENT,
+        id="literal_think_in_content_stream",
     ),
     pytest.param(
         False,
@@ -300,6 +319,18 @@ MULTI_TOKEN_DELTA_CASES = [
         "I need to read the file.\n\n",
         "<tool_call>\n<function=bash>",
         id="tool_call_implicit_reasoning_end",
+    ),
+    pytest.param(
+        ["reasoning</think>Final literal <think> token"],
+        "reasoning",
+        "Final literal <think> token",
+        id="literal_think_after_end_same_delta",
+    ),
+    pytest.param(
+        ["reasoning</think>Final prefix ", "<think> token"],
+        "reasoning",
+        "Final prefix <think> token",
+        id="literal_think_after_end_later_delta",
     ),
 ]
 
