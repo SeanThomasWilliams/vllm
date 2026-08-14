@@ -279,6 +279,55 @@ def test_worker_transfer_submit_failure_reports_failed_metadata():
     assert result.failed_jobs == {42: 1}
 
 
+def test_worker_transfer_submit_exception_reports_failed_metadata(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        worker as worker_module,
+    )
+
+    logger = MagicMock()
+    monkeypatch.setattr(worker_module, "logger", logger)
+
+    spec = MagicMock(spec=OffloadingSpec)
+    worker = worker_module.OffloadingConnectorWorker(
+        spec=spec,
+        kv_cache_config=KVCacheConfig(
+            num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[]
+        ),
+    )
+    worker.worker = MagicMock()
+    worker.worker.submit_transfer.side_effect = [RuntimeError("submit failed"), False]
+
+    src_spec = MagicMock()
+    dst_spec = MagicMock()
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={},
+        worker_transfer_jobs={
+            42: TransferJob(
+                req_id="req-42",
+                src_spec=src_spec,
+                dst_spec=dst_spec,
+            ),
+            43: TransferJob(
+                req_id="req-43",
+                src_spec=src_spec,
+                dst_spec=dst_spec,
+            ),
+        },
+    )
+
+    worker.start_kv_transfers(metadata)
+
+    assert worker.worker.submit_transfer.call_count == 2
+    logger.exception.assert_called_once_with(
+        "Failed to submit worker transfer job %d", 42
+    )
+    result = worker.build_connector_worker_meta()
+    assert result is not None
+    assert result.completed_jobs == {42: 1, 43: 1}
+    assert result.failed_jobs == {42: 1, 43: 1}
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
