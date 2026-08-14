@@ -74,7 +74,7 @@ class FileSystemLookupSpec(LoadStoreSpec):
 
 @dataclass
 class FileSystemControlSpec(LoadStoreSpec):
-    """Worker-visible store commit, abort, or release control spec."""
+    """Worker-visible store commit, abort, release, or finalize control spec."""
 
     action: str
     file_paths: list[str]

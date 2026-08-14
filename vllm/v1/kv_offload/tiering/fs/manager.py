@@ -10,7 +10,8 @@ Scheduler-side store path:
 Worker-side store path:
     Each worker writes and fsyncs its rank slice to a unique temp file.
     After all ranks report, workers atomically commit or abort their temps;
-    successful commits are released only after the all-rank commit ack.
+    successful commits pass an all-rank release barrier before rollback
+    metadata is finalized.
 
 Load path:
     Data is read from the block file directly via os.readv into the
@@ -435,6 +436,14 @@ class FileSystemTierManager(SecondaryTierManager):
         if job_metadata.is_promotion:
             return None
         return self._build_worker_control(job_metadata, "release")
+
+    @override
+    def begin_worker_transfer_finalize(
+        self, job_metadata: TransferJob
+    ) -> WorkerTransferSpec | None:
+        if job_metadata.is_promotion:
+            return None
+        return self._build_worker_control(job_metadata, "finalize")
 
     @override
     def complete_worker_store(

@@ -227,6 +227,12 @@ class SecondaryTierManager(ABC):
         """Begin the worker-side release phase after a successful commit."""
         return None
 
+    def begin_worker_transfer_finalize(
+        self, job_metadata: TransferJob
+    ) -> WorkerTransferSpec | None:
+        """Begin cleanup after the all-rank release barrier succeeds."""
+        return None
+
     def complete_worker_load(self, job_metadata: TransferJob, success: bool) -> None:
         """Finalize a worker-executed secondary -> primary transfer."""
         return

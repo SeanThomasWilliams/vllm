@@ -132,10 +132,9 @@ class FileSystemWorkerTransferHandler:
         self._rank_offset = rank * self._rank_size
         self._store_temp_paths: dict[int, list[str]] = {}
         self._control_jobs: dict[int, str] = {}
-        # Final files replaced by a commit are retained until the explicit
-        # release control phase succeeds. If another rank fails its commit,
-        # the manager sends an abort to every rank and these files must be
-        # removed as part of that rollback.
+        # Final files replaced by a commit are retained until finalize. The
+        # release phase is only a barrier: a failure there must still leave
+        # every rank's matching-inode rollback record available to abort.
         self._committed_final_paths: dict[int, dict[str, tuple[int, int]]] = {}
         self._validated_configs: dict[str, dict[str, Any]] = {}
         self._pool = DualQueueThreadPool(
@@ -287,9 +286,18 @@ class FileSystemWorkerTransferHandler:
                 )
                 for final_path, temp_path in zip(my_final, my_temp)
             )
-        else:
+        elif spec.action == "release":
             tasks = (
                 lambda final_path=final_path, temp_path=temp_path: self._release_one(
+                    final_path=final_path,
+                    temp_path=temp_path,
+                    block_size=spec.block_size,
+                )
+                for final_path, temp_path in zip(my_final, my_temp)
+            )
+        else:
+            tasks = (
+                lambda final_path=final_path, temp_path=temp_path: self._finalize_one(
                     final_path=final_path,
                     temp_path=temp_path,
                     block_size=spec.block_size,
@@ -417,6 +425,11 @@ class FileSystemWorkerTransferHandler:
         """Acknowledge a successful commit without touching its final file."""
         del final_path, temp_path, block_size
 
+    @staticmethod
+    def _finalize_one(*, final_path: str, temp_path: str, block_size: int) -> None:
+        """Acknowledge cleanup without touching a published final file."""
+        del final_path, temp_path, block_size
+
     def _load_one(
         self, *, source_path: str, block_id: int, block_size: int
     ) -> None:
@@ -437,7 +450,7 @@ class FileSystemWorkerTransferHandler:
             action = self._control_jobs.pop(job_id, None)
             if action is not None:
                 self._cleanup_store_temps({job_id})
-                if action in {"abort", "release", "finalize"}:
+                if success and action in {"abort", "finalize"}:
                     self._committed_final_paths.pop(job_id, None)
             elif not success:
                 self._cleanup_store_temps({job_id})
