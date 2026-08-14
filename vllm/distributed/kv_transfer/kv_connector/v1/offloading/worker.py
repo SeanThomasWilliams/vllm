@@ -334,8 +334,8 @@ class OffloadingConnectorWorker:
                 "Submitting worker transfer job %d for req %s: %s -> %s",
                 job_id,
                 entry.req_id,
-                entry.src_spec.medium(),
-                entry.dst_spec.medium(),
+                type(entry.src_spec).__name__,
+                type(entry.dst_spec).__name__,
             )
             try:
                 success = self.worker.submit_transfer(
