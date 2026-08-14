@@ -9,7 +9,8 @@ Scheduler-side store path:
 
 Worker-side store path:
     Each worker writes and fsyncs its rank slice to a unique temp file.
-    After all ranks report, workers atomically commit or abort their temps.
+    After all ranks report, workers atomically commit or abort their temps;
+    successful commits are released only after the all-rank commit ack.
 
 Load path:
     Data is read from the block file directly via os.readv into the
@@ -396,28 +397,50 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = self._worker_lookup_job_keys.pop(job_id)
         self._lookup_manager.complete_worker_lookup(keys, success)
 
+    def _build_worker_control(
+        self, job_metadata: TransferJob, action: str
+    ) -> WorkerTransferSpec:
+        _, dst_spec = self.build_worker_store_transfer(job_metadata)
+        assert dst_spec.temp_file_paths is not None
+        control_spec = FileSystemControlSpec(
+            action=action,
+            file_paths=dst_spec.file_paths,
+            temp_file_paths=dst_spec.temp_file_paths,
+            block_size=dst_spec.block_size,
+            num_ranks=dst_spec.num_ranks,
+            config_path=dst_spec.config_path,
+            run_config=dst_spec.run_config,
+        )
+        return WorkerTransferSpec(
+            req_id=job_metadata.req_context.req_id,
+            src_spec=control_spec,
+            dst_spec=control_spec,
+            operation=action,
+        )
+
     @override
     def begin_worker_transfer_completion(
         self, job_metadata: TransferJob, success: bool
     ) -> WorkerTransferSpec | None:
         if job_metadata.is_promotion:
             return None
-        _, dst_spec = self.build_worker_store_transfer(job_metadata)
-        assert dst_spec.temp_file_paths is not None
-        control_spec = FileSystemControlSpec(
-            action="commit" if success else "abort",
-            file_paths=dst_spec.file_paths, temp_file_paths=dst_spec.temp_file_paths,
-            block_size=dst_spec.block_size, num_ranks=dst_spec.num_ranks,
-            config_path=dst_spec.config_path, run_config=dst_spec.run_config,
-        )
-        return WorkerTransferSpec(
-            req_id=job_metadata.req_context.req_id,
-            src_spec=control_spec, dst_spec=control_spec,
-            operation=control_spec.action,
+        return self._build_worker_control(
+            job_metadata, "commit" if success else "abort"
         )
 
     @override
-    def complete_worker_store(self, job_metadata: TransferJob, success: bool) -> None:
+    def begin_worker_transfer_release(
+        self, job_metadata: TransferJob
+    ) -> WorkerTransferSpec | None:
+        if job_metadata.is_promotion:
+            return None
+        return self._build_worker_control(job_metadata, "release")
+
+    @override
+    def complete_worker_store(
+        self, job_metadata: TransferJob, success: bool
+    ) -> None:
+        """Publish a store only after the worker control phase succeeds."""
         if success:
             keys = list(job_metadata.keys)
             self._lookup_manager.mark_present(keys)

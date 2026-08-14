@@ -264,7 +264,6 @@ class TieringOffloadingManager(OffloadingManager):
             if job_id not in self._jobs and job_id not in self._worker_transfer_jobs:
                 self._job_id_counter = max(self._job_id_counter, job_id + 1)
                 return job_id
-
     def _register_job(self, transfer_job: TransferJob, tier_idx: int) -> None:
         job_metadata = JobMetadata(transfer_job, tier_idx)
         self._jobs[transfer_job.job_id] = job_metadata
@@ -298,7 +297,6 @@ class TieringOffloadingManager(OffloadingManager):
                 operation="load" if pending.is_promotion else "store",
             )
         self._pending_worker_transfers.clear()
-
         for tier in self.secondary_tiers:
             pop_lookup_jobs = getattr(tier, "pop_worker_lookup_jobs", None)
             if pop_lookup_jobs is None:
@@ -335,14 +333,28 @@ class TieringOffloadingManager(OffloadingManager):
         self, job_id: JobId, success: bool
     ) -> WorkerTransferSpec | None:
         tier, job, initial_success, operation = self._worker_control_states[job_id]
-        if operation == "commit" and not success:
+        if operation == "commit":
+            if not success:
+                control = tier.begin_worker_transfer_completion(job, False)
+                assert control is not None
+                self._worker_control_states[job_id] = (tier, job, False, control.operation)
+                return control
+            control = tier.begin_worker_transfer_release(job)
+            if control is not None:
+                self._worker_control_states[job_id] = (tier, job, initial_success, control.operation)
+                return control
+        if operation in {"release", "finalize"} and not success:
             control = tier.begin_worker_transfer_completion(job, False)
-            assert control is not None
-            self._worker_control_states[job_id] = (tier, job, False, control.operation)
-            return control
+            if control is not None:
+                self._worker_control_states[job_id] = (tier, job, False, control.operation)
+                return control
         self._worker_control_states.pop(job_id)
         self._worker_transfer_jobs.pop(job_id)
-        final_success = initial_success and operation == "commit" and success
+        final_success = (
+            initial_success and success
+            if operation in {"release", "finalize"}
+            else initial_success and operation == "commit" and success
+        )
         tier.complete_worker_store(job, final_success)
         self.primary_tier.complete_read(job.keys, job.req_context)
         return None
@@ -552,8 +564,6 @@ class TieringOffloadingManager(OffloadingManager):
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
-        # Worker-transfer tiers defer the whole operation to connector metadata;
-        # the scheduler must not submit filesystem work itself.
         tier = self.secondary_tiers[tier_idx]
         if tier.uses_worker_transfers():
             self._pending_worker_transfers.append(

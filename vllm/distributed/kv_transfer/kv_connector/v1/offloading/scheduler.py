@@ -1722,7 +1722,12 @@ class OffloadingConnectorScheduler:
                     self.manager.complete_worker_lookup(job_id, success)
                     del self._jobs[job_id]
                     continue
-                if job_status.worker_operation in {"commit", "abort"}:
+                if job_status.worker_operation in {
+                    "commit",
+                    "abort",
+                    "release",
+                    "finalize",
+                }:
                     control = self.manager.complete_worker_control(job_id, success)
                 else:
                     control = self.manager.complete_worker_transfer(job_id, success)
