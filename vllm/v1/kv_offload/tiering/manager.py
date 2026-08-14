@@ -204,6 +204,8 @@ class TieringOffloadingManager(OffloadingManager):
         self,
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
+        *,
+        retain_primary_cache: bool = True,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -215,6 +217,16 @@ class TieringOffloadingManager(OffloadingManager):
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        if not isinstance(retain_primary_cache, bool):
+            raise ValueError("retain_primary_cache must be a boolean")
+        if not retain_primary_cache and not self.secondary_tiers:
+            raise ValueError(
+                "retain_primary_cache=false requires at least one secondary tier"
+            )
+        self.retain_primary_cache = retain_primary_cache
+        self._pending_primary_discards: set[OffloadKey] = set()
+        self._promoted_discards_by_req: dict[str, set[OffloadKey]] = {}
+        self._orphaned_promoted_discards: set[OffloadKey] = set()
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -330,6 +342,43 @@ class TieringOffloadingManager(OffloadingManager):
                 transfer_job.req_context,
                 False,
             )
+        if not self.retain_primary_cache and successful_keys:
+            req_id = transfer_job.req_context.req_id
+            state = self._req_state.get(req_id)
+            if state is None or state.is_finished:
+                self._orphaned_promoted_discards.update(successful_keys)
+                self._discard_orphaned_promotions(successful_keys)
+            else:
+                self._promoted_discards_by_req.setdefault(req_id, set()).update(
+                    successful_keys
+                )
+
+    def _discard_idle_primary_blocks(self) -> None:
+        removed = self.primary_tier.discard_ready(self._pending_primary_discards)
+        self._pending_primary_discards.difference_update(removed)
+
+    def _discard_loaded_promotions(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        owned = self._promoted_discards_by_req.get(req_context.req_id)
+        candidates = self._orphaned_promoted_discards.intersection(keys)
+        if owned is not None:
+            candidates.update(owned.intersection(keys))
+        removed = self.primary_tier.discard_ready(candidates)
+        self._orphaned_promoted_discards.difference_update(removed)
+        if owned is not None:
+            owned.difference_update(removed)
+            if not owned:
+                self._promoted_discards_by_req.pop(req_context.req_id, None)
+
+    def _discard_orphaned_promotions(
+        self, keys: Collection[OffloadKey] | None = None
+    ) -> None:
+        candidates = self._orphaned_promoted_discards
+        if keys is not None:
+            candidates = candidates.intersection(keys)
+        removed = self.primary_tier.discard_ready(candidates)
+        self._orphaned_promoted_discards.difference_update(removed)
 
     def _process_finished_jobs(self):
         """
@@ -364,6 +413,9 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
+                    if not self.retain_primary_cache:
+                        self._pending_primary_discards.update(transfer_job.keys)
+                        self._discard_idle_primary_blocks()
 
     def pop_worker_transfer_jobs(
         self, allocate_job_id: Callable[[], JobId]
@@ -413,9 +465,21 @@ class TieringOffloadingManager(OffloadingManager):
         if job.is_promotion:
             tier.complete_worker_load(job, success)
             self.primary_tier.complete_write(job.keys, job.req_context, success)
+            if not self.retain_primary_cache and success:
+                state = self._req_state.get(job.req_context.req_id)
+                if state is None or state.is_finished:
+                    self._orphaned_promoted_discards.update(job.keys)
+                    self._discard_orphaned_promotions(job.keys)
+                else:
+                    self._promoted_discards_by_req.setdefault(
+                        job.req_context.req_id, set()
+                    ).update(job.keys)
         else:
             tier.complete_worker_store(job, success)
             self.primary_tier.complete_read(job.keys, job.req_context)
+            if not self.retain_primary_cache:
+                self._pending_primary_discards.update(job.keys)
+                self._discard_idle_primary_blocks()
         return None
 
     def complete_worker_control(
@@ -457,6 +521,9 @@ class TieringOffloadingManager(OffloadingManager):
         )
         tier.complete_worker_store(job, final_success)
         self.primary_tier.complete_read(job.keys, job.req_context)
+        if not self.retain_primary_cache:
+            self._pending_primary_discards.update(job.keys)
+            self._discard_idle_primary_blocks()
         return None
 
     @override
@@ -679,6 +746,9 @@ class TieringOffloadingManager(OffloadingManager):
             req_context: Per-request context.
         """
         self.primary_tier.complete_load(keys, req_context)
+        if not self.retain_primary_cache:
+            self._discard_loaded_promotions(keys, req_context)
+            self._discard_idle_primary_blocks()
 
     @override
     def prepare_store(
@@ -896,6 +966,11 @@ class TieringOffloadingManager(OffloadingManager):
         state = self._req_state[req_context.req_id]
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier_idx)
+        if not self.retain_primary_cache:
+            promoted = self._promoted_discards_by_req.pop(req_context.req_id, set())
+            self._orphaned_promoted_discards.update(promoted)
+            self._discard_orphaned_promotions(promoted)
+            self._discard_idle_primary_blocks()
 
     def _maybe_finalize_request(
         self,
@@ -1021,6 +1096,9 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        self._pending_primary_discards.clear()
+        self._promoted_discards_by_req.clear()
+        self._orphaned_promoted_discards.clear()
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]

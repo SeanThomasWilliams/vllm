@@ -270,6 +270,31 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
+    def discard_ready(self, keys: Collection[OffloadKey]) -> set[OffloadKey]:
+        """Drop idle ready blocks and return the keys that were removed.
+
+        Tiering managers use this after durable secondary-tier completion when
+        the CPU primary is configured as a transfer working set rather than a
+        retained cache. Active and in-flight blocks are left untouched so the
+        caller can retry after their references are released.
+        """
+        removed: set[OffloadKey] = set()
+        for key in keys:
+            block = self._policy.get(key)
+            if block is None or not block.is_ready or block.ref_cnt != 0:
+                continue
+            self._policy.remove(key)
+            self._num_evictable_cache_blocks -= 1
+            assert self._num_evictable_cache_blocks >= 0
+            self._free_block(block)
+            removed.add(key)
+
+        if removed and self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=list(removed), medium=self.medium, removed=True)
+            )
+        return removed
+
     @override
     def reset_cache(self) -> None:
         # Clear ALL blocks unconditionally. The scheduler's _stale_job_threshold

@@ -16,6 +16,9 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - retain_primary_cache: (optional) Keep idle blocks in the CPU primary tier
+    (default: true). Set false when CPU is only a transfer working set and
+    persistent capacity must belong exclusively to secondary tiers.
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "fs",
@@ -32,6 +35,7 @@ Example configuration:
     "cpu_bytes_to_use": 10737418240,  # 10 GB
     "block_size": 16,
     "eviction_policy": "lru",
+    "retain_primary_cache": True,
     "secondary_tiers": [
         {
             "type": "example",
@@ -260,6 +264,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
+        self.retain_primary_cache = self.extra_config.get(
+            "retain_primary_cache", True
+        )
+        if not isinstance(self.retain_primary_cache, bool):
+            raise ValueError("retain_primary_cache must be a boolean")
+        if not self.retain_primary_cache and not self.secondary_tier_configs:
+            raise ValueError(
+                "retain_primary_cache=false requires at least one secondary tier"
+            )
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
@@ -339,6 +352,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
+                    retain_primary_cache=self.retain_primary_cache,
                 )
                 self._manager = tiering_manager
             except Exception:
