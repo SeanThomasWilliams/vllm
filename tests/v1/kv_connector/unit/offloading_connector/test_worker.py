@@ -38,6 +38,12 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.tiering.fs.common import (
+    FileSystemControlSpec,
+    FileSystemLoadStoreSpec,
+)
+from vllm.v1.kv_offload.tiering.fs.worker import FileSystemWorkerTransferHandler
 
 NUM_BLOCKS = 10
 BLOCK_SIZE = 16
@@ -245,6 +251,102 @@ def test_register_kv_caches_shared_layers_with_different_offsets():
             CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=page_size),
         ]
     ]
+
+
+def test_packed_cache_with_offset_roundtrips_entire_block_bytes(tmp_path):
+    layer_name = "model.layers.0.self_attn"
+    num_blocks = 2
+    kv_cache_spec = FullAttentionSpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    page_size = kv_cache_spec.page_size_bytes
+    block_stride = page_size * 2
+    offset = page_size // 2
+    elem_size = torch.empty((), dtype=torch.float32).element_size()
+    storage = torch.empty(
+        (offset + num_blocks * block_stride) // elem_size,
+        dtype=torch.float32,
+    )
+    storage.view(torch.uint8).copy_(
+        torch.arange(storage.numel() * elem_size, dtype=torch.uint8)
+    )
+    kv_cache = storage.as_strided(
+        (num_blocks, page_size // elem_size),
+        (block_stride // elem_size, 1),
+        storage_offset=offset // elem_size,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * block_stride,
+                shared_by=[layer_name],
+                offset=offset,
+                block_stride=block_stride,
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[layer_name], kv_cache_spec=kv_cache_spec
+            )
+        ],
+    )
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches({layer_name: kv_cache})
+    canonical = spec.get_worker.call_args.args[0]
+    packed = canonical.tensors[0].tensor
+    assert packed.storage_offset() == offset
+    expected = packed[0].clone()
+
+    final_path = tmp_path / "packed.bin"
+    temp_path = tmp_path / "packed.tmp"
+    store_handler = FileSystemWorkerTransferHandler(
+        [packed], rank=0, n_read_threads=1, n_write_threads=1
+    )
+    try:
+        store_spec = FileSystemLoadStoreSpec(
+            file_paths=[str(final_path)],
+            temp_file_paths=[str(temp_path)],
+            block_size=block_stride,
+        )
+        assert store_handler.submit_store(1, CPULoadStoreSpec([0]), store_spec)
+        store_handler.wait()
+        assert store_handler.get_finished()[0].success
+        assert store_handler.submit_control(
+            1,
+            FileSystemControlSpec(
+                action="commit",
+                file_paths=store_spec.file_paths,
+                temp_file_paths=store_spec.temp_file_paths or [],
+                block_size=store_spec.block_size,
+            ),
+        )
+        store_handler.wait()
+        assert store_handler.get_finished()[0].success
+    finally:
+        store_handler.shutdown()
+
+    restored = torch.zeros_like(packed)
+    load_handler = FileSystemWorkerTransferHandler(
+        [restored], rank=0, n_read_threads=1, n_write_threads=1
+    )
+    try:
+        assert load_handler.submit_load(
+            2,
+            FileSystemLoadStoreSpec(
+                file_paths=[str(final_path)], block_size=block_stride
+            ),
+            CPULoadStoreSpec([0]),
+        )
+        load_handler.wait()
+        assert load_handler.get_finished()[0].success
+        assert torch.equal(restored[0], expected)
+    finally:
+        load_handler.shutdown()
 
 
 def test_worker_transfer_submit_failure_reports_failed_metadata():

@@ -161,7 +161,7 @@ class OffloadingConnectorWorker:
             packed_tensor = tensor.as_strided(
                 (num_blocks, block_stride),
                 (block_stride, 1),
-                storage_offset=0,
+                storage_offset=tensor.storage_offset(),
             )
             self._init_worker(
                 CanonicalKVCaches(

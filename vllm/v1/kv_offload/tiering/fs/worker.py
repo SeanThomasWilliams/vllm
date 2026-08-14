@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import hashlib
+import hmac
 import os
 import stat
 from typing import Any
@@ -20,6 +22,9 @@ from vllm.v1.kv_offload.tiering.fs.common import (
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 logger = init_logger(__name__)
+
+_DIGEST_SIZE = hashlib.sha256().digest_size
+_DIGEST_CHUNK_SIZE = 1024 * 1024
 
 
 def _write_all_at(fd: int, view: memoryview, offset: int) -> None:
@@ -44,6 +49,73 @@ def _read_exact_at(fd: int, view: memoryview, offset: int) -> None:
         read = end
 
 
+def _digest_at(fd: int, length: int) -> bytes:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < length:
+        chunk = os.pread(fd, min(_DIGEST_CHUNK_SIZE, length - offset), offset)
+        if not chunk:
+            raise OSError(f"Short read while hashing filesystem block at {offset}")
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.digest()
+
+
+def _validate_block_fd(fd: int, block_size: int) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_size != block_size + _DIGEST_SIZE
+    ):
+        raise OSError("Filesystem block type, link count, or size is invalid")
+    expected = os.pread(fd, _DIGEST_SIZE, block_size)
+    if len(expected) != _DIGEST_SIZE or not hmac.compare_digest(
+        expected, _digest_at(fd, block_size)
+    ):
+        raise OSError("Filesystem block integrity digest does not match")
+
+
+def _open_validated_block(path: str, block_size: int) -> int:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        _validate_block_fd(fd, block_size)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _lstat_safe_final(path: str):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise OSError(f"Filesystem block final is not a safe file: {path}")
+    return info
+
+
+def _is_valid_block(path: str, block_size: int) -> bool:
+    try:
+        fd = _open_validated_block(path, block_size)
+    except (FileNotFoundError, OSError):
+        return False
+    os.close(fd)
+    return True
+
+
+def _fsync_parent(path: str) -> None:
+    dir_fd = os.open(
+        os.path.dirname(path) or ".",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+    )
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class FileSystemWorkerTransferHandler:
     """Worker-side CPU shard <-> filesystem transfer executor."""
 
@@ -60,6 +132,11 @@ class FileSystemWorkerTransferHandler:
         self._rank_offset = rank * self._rank_size
         self._store_temp_paths: dict[int, list[str]] = {}
         self._control_jobs: dict[int, str] = {}
+        # Final files replaced by a commit are retained until the job's
+        # control phase is known to have succeeded.  If another rank fails
+        # its commit, the manager sends an abort to every rank and these
+        # files must be removed as part of that rollback.
+        self._committed_final_paths: dict[int, dict[str, tuple[int, int]]] = {}
         self._validated_configs: dict[str, dict[str, Any]] = {}
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -158,6 +235,7 @@ class FileSystemWorkerTransferHandler:
             lambda source_path=source_path, bid=int(block_id): self._load_one(
                 source_path=source_path,
                 block_id=bid,
+                block_size=src_spec.block_size,
             )
             for source_path, block_id in zip(my_files, dst_spec.block_ids)
         )
@@ -185,27 +263,38 @@ class FileSystemWorkerTransferHandler:
         my_temp = self._select_rank_paths(spec.temp_file_paths, spec.num_ranks)
         if len(my_final) != len(my_temp):
             raise ValueError("Filesystem control paths must have equal lengths")
-        self._control_jobs[job_id] = spec.action
-        task = self._commit_one if spec.action == "commit" else self._abort_one
         if spec.action not in {"commit", "abort"}:
             raise ValueError(f"Unknown filesystem control action: {spec.action}")
-        tasks = (
-            lambda final_path=final_path, temp_path=temp_path: task(
-                final_path=final_path,
-                temp_path=temp_path,
-                block_size=spec.block_size,
+        self._control_jobs[job_id] = spec.action
+        if spec.action == "commit":
+            tasks = (
+                lambda final_path=final_path, temp_path=temp_path: self._commit_one(
+                    job_id=job_id,
+                    final_path=final_path,
+                    temp_path=temp_path,
+                    block_size=spec.block_size,
+                )
+                for final_path, temp_path in zip(my_final, my_temp)
             )
-            for final_path, temp_path in zip(my_final, my_temp)
-        )
+        else:
+            committed_final_paths = self._committed_final_paths.get(job_id, {})
+            tasks = (
+                lambda final_path=final_path, temp_path=temp_path: self._abort_one(
+                    final_path=final_path,
+                    temp_path=temp_path,
+                    block_size=spec.block_size,
+                    committed_final=committed_final_paths.get(final_path),
+                )
+                for final_path, temp_path in zip(my_final, my_temp)
+            )
         self._pool.enqueue_store(job_id, len(my_final), tasks)
         return True
 
     @staticmethod
     def _lookup_files(paths: list[str], block_size: int) -> None:
         for path in paths:
-            info = os.stat(path)
-            if not stat.S_ISREG(info.st_mode) or info.st_size != block_size:
-                raise OSError(f"Invalid filesystem block file: {path}")
+            fd = _open_validated_block(path, block_size)
+            os.close(fd)
 
     def _store_one(
         self,
@@ -215,26 +304,28 @@ class FileSystemWorkerTransferHandler:
         temp_path: str,
         block_size: int,
     ) -> None:
-        try:
-            info = os.stat(final_path)
-        except FileNotFoundError:
-            info = None
-        if info is not None:
-            if stat.S_ISREG(info.st_mode) and info.st_size == block_size:
-                return
-            raise OSError(f"Pre-existing final is not a valid block: {final_path}")
+        _lstat_safe_final(final_path)
+        if _is_valid_block(final_path, block_size):
+            return
 
-        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_TRUNC
-        fd = os.open(temp_path, flags, 0o644)
+        os.makedirs(os.path.dirname(temp_path) or ".", exist_ok=True)
+        flags = (
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_RDWR
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+        )
+        fd = os.open(temp_path, flags, 0o600)
         try:
-            os.ftruncate(fd, block_size)
+            os.ftruncate(fd, block_size + _DIGEST_SIZE)
             offset = self._rank_offset
             for tensor in self._cpu_tensors:
                 row = tensor[block_id].numpy()
                 view = memoryview(row).cast("B")
                 _write_all_at(fd, view, offset)
                 offset += len(view)
+            _write_all_at(fd, memoryview(_digest_at(fd, block_size)), block_size)
             os.fsync(fd)
         except Exception:
             with contextlib.suppress(FileNotFoundError):
@@ -244,41 +335,78 @@ class FileSystemWorkerTransferHandler:
             os.close(fd)
 
     def _commit_one(
-        self, *, final_path: str, temp_path: str, block_size: int
+        self,
+        *,
+        job_id: int,
+        final_path: str,
+        temp_path: str,
+        block_size: int,
     ) -> None:
         try:
-            info = os.stat(final_path)
-        except FileNotFoundError:
-            info = None
-        if info is not None:
-            if not stat.S_ISREG(info.st_mode) or info.st_size != block_size:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(temp_path)
-                raise OSError(f"Pre-existing final is not a valid block: {final_path}")
+            _lstat_safe_final(final_path)
+        except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temp_path)
-        else:
+            raise
+        if _is_valid_block(final_path, block_size):
             try:
-                os.replace(temp_path, final_path)
-            except Exception:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(temp_path)
-                raise
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                return
+            _fsync_parent(final_path)
+            return
 
-        dir_fd = os.open(os.path.dirname(final_path), os.O_RDONLY)
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            temp_fd = _open_validated_block(temp_path, block_size)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_path)
+            raise
+        else:
+            os.close(temp_fd)
+
+        try:
+            os.replace(temp_path, final_path)
+            info = os.stat(final_path)
+            self._committed_final_paths.setdefault(job_id, {})[final_path] = (
+                info.st_dev,
+                info.st_ino,
+            )
+            _fsync_parent(final_path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_path)
+            raise
 
     @staticmethod
-    def _abort_one(*, final_path: str, temp_path: str, block_size: int) -> None:
-        del final_path, block_size
+    def _abort_one(
+        *,
+        final_path: str,
+        temp_path: str,
+        block_size: int,
+        committed_final: tuple[int, int] | None,
+    ) -> None:
+        del block_size
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp_path)
+        if committed_final is None:
+            return
+        try:
+            info = os.lstat(final_path)
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and (info.st_dev, info.st_ino) == committed_final
+        ):
+            os.unlink(final_path)
+            _fsync_parent(final_path)
 
-    def _load_one(self, *, source_path: str, block_id: int) -> None:
-        fd = os.open(source_path, os.O_RDONLY)
+    def _load_one(
+        self, *, source_path: str, block_id: int, block_size: int
+    ) -> None:
+        fd = _open_validated_block(source_path, block_size)
         try:
             offset = self._rank_offset
             for tensor in self._cpu_tensors:
@@ -292,9 +420,11 @@ class FileSystemWorkerTransferHandler:
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
         for job_id, success in self._pool.get_finished():
-            if job_id in self._control_jobs:
-                self._control_jobs.pop(job_id, None)
+            action = self._control_jobs.pop(job_id, None)
+            if action is not None:
                 self._cleanup_store_temps({job_id})
+                if action == "abort":
+                    self._committed_final_paths.pop(job_id, None)
             elif not success:
                 self._cleanup_store_temps({job_id})
             results.append(
@@ -320,3 +450,4 @@ class FileSystemWorkerTransferHandler:
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
         self._cleanup_store_temps(set(self._store_temp_paths))
+        self._committed_final_paths.clear()
