@@ -137,6 +137,7 @@ class FileSystemWorkerTransferHandler:
         # every rank's matching-inode rollback record available to abort.
         self._committed_final_paths: dict[int, dict[str, tuple[int, int]]] = {}
         self._validated_configs: dict[str, dict[str, Any]] = {}
+        self._lookup_results: list[TransferResult] = []
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
@@ -247,10 +248,25 @@ class FileSystemWorkerTransferHandler:
         self._ensure_config(spec)
         num_ranks = spec.num_ranks
         my_files = self._select_rank_paths(spec.file_paths, num_ranks)
-        self._pool.enqueue_load(
-            job_id,
-            1,
-            [lambda: self._lookup_files(my_files, spec.block_size)],
+        # Worker lookups are already dispatched asynchronously from the
+        # scheduler in one batched collective. Resolve each local rank's paths
+        # inline so expected cold-cache misses do not create and error-log one
+        # thread-pool task per four-token DeepSeek block.
+        success = True
+        try:
+            self._lookup_files(my_files, spec.block_size)
+        except FileNotFoundError:
+            success = False
+        except OSError as exc:
+            logger.error("Filesystem lookup failed: %s", exc)
+            success = False
+        self._lookup_results.append(
+            TransferResult(
+                job_id=job_id,
+                success=success,
+                transfer_size=None,
+                transfer_time=None,
+            )
         )
         return True
 
@@ -445,7 +461,8 @@ class FileSystemWorkerTransferHandler:
             os.close(fd)
 
     def get_finished(self) -> list[TransferResult]:
-        results: list[TransferResult] = []
+        results = self._lookup_results
+        self._lookup_results = []
         for job_id, success in self._pool.get_finished():
             action = self._control_jobs.pop(job_id, None)
             if action is not None:
