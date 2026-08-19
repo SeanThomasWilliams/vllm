@@ -1513,6 +1513,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
             num_draft_tokens_per_req=num_draft_tokens_per_req,
+            scheduled_num_draft_tokens_per_req=(
+                None
+                if num_draft_tokens_per_req is None
+                else num_draft_tokens_per_req.copy()
+            ),
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,

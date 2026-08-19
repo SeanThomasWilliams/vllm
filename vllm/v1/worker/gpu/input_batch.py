@@ -104,6 +104,9 @@ class InputBatch:
 
     max_req_tokens: int | None = None
     valid_num_draft_tokens_per_req: np.ndarray | None = None
+    # [num_reqs] draft rows emitted by the scheduler before adaptive capacity
+    # compaction. Structured-output masks retain this layout after compaction.
+    scheduled_num_draft_tokens_per_req: np.ndarray | None = None
 
     # When > 0, dummy batches carry seeded-random token ids instead of zeros.
     # All-zero ids embed identically, so every dummy token routes to the SAME

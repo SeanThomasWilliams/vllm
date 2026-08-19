@@ -13,7 +13,7 @@ def _build_grammar_mapping(
     req_ids: list[str],
     grammar_req_ids: list[str],
     cu_num_logits_np: np.ndarray,
-    num_draft_tokens_per_req: np.ndarray | None,
+    scheduled_num_draft_tokens_per_req: np.ndarray | None,
     num_bonus_tokens: int,
     mask_stride: int,
 ) -> list[int]:
@@ -21,14 +21,16 @@ def _build_grammar_mapping(
     req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
     for grammar_req_id in grammar_req_ids:
         req_idx = req_id_to_idx[grammar_req_id]
-        if num_draft_tokens_per_req is None:
+        if scheduled_num_draft_tokens_per_req is None:
             num_positions = int(
                 cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
             )
         else:
             # Grammar masks follow the scheduled layout even when capacity
             # verification compacts the actual logits to bonus-only rows.
-            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
+            num_positions = (
+                int(scheduled_num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
+            )
         mapping.extend(
             req_idx * mask_stride + position for position in range(num_positions)
         )
@@ -78,7 +80,7 @@ class StructuredOutputsWorker:
             input_batch.req_ids,
             grammar_req_ids,
             input_batch.cu_num_logits_np,
-            input_batch.num_draft_tokens_per_req,
+            input_batch.scheduled_num_draft_tokens_per_req,
             self.num_bonus_tokens,
             self.mask_stride,
         )
