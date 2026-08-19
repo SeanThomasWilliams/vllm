@@ -40,7 +40,7 @@ def test_global_topk_ignores_stale_padding_request_index() -> None:
         block_size=2,
         is_valid_token=is_valid_token,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # Padding-row indices are unspecified; the zero length makes them inert.
     assert indices.cpu().tolist()[0] == [20, 21, 22, -1]
@@ -60,7 +60,32 @@ def test_dcp_global_topk_ignores_stale_padding_request_index() -> None:
         dcp_rank=0,
         cp_kv_cache_interleave_size=1,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert indices.cpu().tolist() == [[20, 21, -1, -1], [-1, -1, -1, -1]]
     assert lengths.cpu().tolist() == [2, 0]
+
+
+def test_global_topk_reuses_output_buffers_for_valid_and_padding_rows() -> None:
+    topk_indices, token_to_req_indices, block_table, is_valid_token = _inputs()
+    expected = compute_global_topk_indices_and_lens(
+        topk_indices,
+        token_to_req_indices,
+        block_table,
+        block_size=2,
+        is_valid_token=is_valid_token,
+    )
+    outputs = tuple(torch.empty_like(tensor) for tensor in expected)
+    actual = compute_global_topk_indices_and_lens(
+        topk_indices,
+        token_to_req_indices,
+        block_table,
+        block_size=2,
+        is_valid_token=is_valid_token,
+        output_buffers=outputs,
+    )
+    torch.accelerator.synchronize()
+
+    for result, output, reference in zip(actual, outputs, expected):
+        assert result.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(result, reference)
