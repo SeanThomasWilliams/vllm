@@ -329,6 +329,25 @@ class OffloadingConnectorWorker:
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
+        for job_id, entry in metadata.worker_transfer_jobs.items():
+            logger.debug(
+                "Submitting worker transfer job %d for req %s: %s -> %s",
+                job_id,
+                entry.req_id,
+                entry.src_spec.medium(),
+                entry.dst_spec.medium(),
+            )
+            try:
+                success = self.worker.submit_transfer(
+                    job_id, entry.src_spec, entry.dst_spec
+                )
+            except Exception:
+                logger.exception("Failed to submit worker transfer job %d", job_id)
+                self._connector_worker_meta.mark_completed(job_id, success=False)
+                continue
+            if not success:
+                self._connector_worker_meta.mark_completed(job_id, success=False)
+
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
             if not self._is_store_writer:
@@ -356,9 +375,7 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
             if (
                 transfer_result.transfer_time is not None
@@ -373,9 +390,11 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
+            self._connector_worker_meta.mark_completed(
+                job_id, transfer_result.success
+            )
             req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            if req_id is not None and transfer_result.success:
                 finished_recving.add(req_id)
 
         return set(), finished_recving

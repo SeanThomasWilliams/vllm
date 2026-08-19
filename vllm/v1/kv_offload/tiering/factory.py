@@ -47,6 +47,11 @@ class SecondaryTierFactory:
         config = tier_config.copy()
         tier_type = config.pop("type")
         config.pop("module_path", None)
+        if (
+            tier_type == "fs"
+            and offloading_spec.config.parallel.world_size > 1
+        ):
+            config["worker_transfers"] = True
         return tier_cls(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,

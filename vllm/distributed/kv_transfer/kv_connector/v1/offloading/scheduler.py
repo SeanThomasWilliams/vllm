@@ -76,6 +76,9 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    failed_count: int = 0
+    is_worker_transfer: bool = False
+    worker_operation: str | None = None
     # Store source blocks fenced after the request finishes.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
@@ -625,6 +628,7 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        self._pending_worker_control_jobs: dict[int, TransferJob] = {}
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -1600,9 +1604,34 @@ class OffloadingConnectorScheduler:
 
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+
+        worker_transfer_jobs: dict[int, TransferJob] = {}
+        pop_worker_transfer_jobs = getattr(
+            self.manager, "pop_worker_transfer_jobs", None
+        )
+        if pop_worker_transfer_jobs is not None:
+            for job_id, job in pop_worker_transfer_jobs(self._generate_job_id).items():
+                worker_transfer_jobs[job_id] = TransferJob(
+                    req_id=job.req_id,
+                    src_spec=job.src_spec,
+                    dst_spec=job.dst_spec,
+                    operation=job.operation,
+                )
+                self._jobs[job_id] = TransferJobStatus(
+                    req_id=job.req_id,
+                    pending_count=self.config.num_workers,
+                    keys=set(),
+                    is_store=False,
+                    is_worker_transfer=True,
+                    worker_operation=job.operation,
+                )
+        worker_transfer_jobs.update(self._pending_worker_control_jobs)
+        self._pending_worker_control_jobs.clear()
+
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
+            worker_transfer_jobs=worker_transfer_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 
@@ -1682,9 +1711,34 @@ class OffloadingConnectorScheduler:
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
+            job_status.failed_count += meta.failed_jobs.get(job_id, 0)
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
+
+            if job_status.is_worker_transfer:
+                success = job_status.failed_count == 0
+                if job_status.worker_operation == "lookup":
+                    self.manager.complete_worker_lookup(job_id, success)
+                    del self._jobs[job_id]
+                    continue
+                if job_status.worker_operation in {"commit", "abort"}:
+                    control = self.manager.complete_worker_control(job_id, success)
+                else:
+                    control = self.manager.complete_worker_transfer(job_id, success)
+                if control is not None:
+                    job_status.pending_count = self.config.num_workers
+                    job_status.failed_count = 0
+                    job_status.worker_operation = control.operation
+                    self._pending_worker_control_jobs[job_id] = TransferJob(
+                        req_id=control.req_id,
+                        src_spec=control.src_spec,
+                        dst_spec=control.dst_spec,
+                        operation=control.operation,
+                    )
+                    continue
+                del self._jobs[job_id]
+                continue
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
@@ -1808,6 +1862,7 @@ class OffloadingConnectorScheduler:
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
+        self._pending_worker_control_jobs.clear()
         self._block_id_to_pending_jobs.clear()
 
         # The manager pool is empty; pending event payloads and announced

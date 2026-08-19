@@ -44,8 +44,9 @@ class FileMapper:
         canonical_format: str | None = None,
     ):
         """
-        Initialize the file mapper. Each worker constructs its own, but
-        `config.json` is shared across workers since rank lives outside the hash.
+        Initialize the file mapper. Scheduler and workers construct their own,
+        but `config.json` is shared across workers since rank lives outside the
+        hash.
         When `parallel_agnostic=True`, tp/pp/pcp/dcp are forced to 1 and rank
         to 0 so multiple parallelism layouts collapse into the same folder.
         """
@@ -122,13 +123,14 @@ class FileMapper:
             canonical_format=canonical_format,
         )
 
-    def get_file_name(self, key: OffloadKey) -> str:
+    def get_file_name(self, key: OffloadKey, rank: int | None = None) -> str:
         """Map an OffloadKey to <base>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash>.bin."""
         hash_hex = get_offload_block_hash(key).hex()
         group_idx = get_offload_group_idx(key)
+        file_rank = self.rank if rank is None else rank
         subfolder1, subfolder2 = hash_hex[:3], hash_hex[3:5]
         return (
-            f"{self.base_path}_r{self.rank}"
+            f"{self.base_path}_r{file_rank}"
             f"/{subfolder1}/{subfolder2}_g{group_idx}/{hash_hex}.bin"
         )
 

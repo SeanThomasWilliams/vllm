@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 
 from vllm.v1.kv_offload.base import (
+    LoadStoreSpec,
     Locality,
     LookupResult,
     Medium,
@@ -195,6 +196,36 @@ class SecondaryTierManager(ABC):
                           identifying the primary-tier slots to read from.
         """
         pass
+
+    def uses_worker_transfers(self) -> bool:
+        """Whether primary/secondary copies execute on all-rank workers."""
+        return False
+
+    def build_worker_store_transfer(
+        self, job_metadata: TransferJob
+    ) -> tuple[LoadStoreSpec, LoadStoreSpec]:
+        raise NotImplementedError
+
+    def build_worker_load_transfer(
+        self, job_metadata: TransferJob
+    ) -> tuple[LoadStoreSpec, LoadStoreSpec]:
+        raise NotImplementedError
+
+    def complete_worker_store(
+        self, job_metadata: TransferJob, success: bool
+    ) -> None:
+        return
+
+    def begin_worker_transfer_completion(
+        self, job_metadata: TransferJob, success: bool
+    ) -> WorkerTransferSpec | None:
+        return None
+
+    def complete_worker_load(self, job_metadata: TransferJob, success: bool) -> None:
+        return
+
+    def abort_worker_transfers(self) -> None:
+        return
 
     @abstractmethod
     def submit_load(self, job_metadata: TransferJob) -> None:

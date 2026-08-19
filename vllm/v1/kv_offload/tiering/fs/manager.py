@@ -3,9 +3,13 @@
 """
 FileSystemTierManager: Pure-Python file system secondary tier for KV cache offloading.
 
-Store path:
+Scheduler-side store path:
     Data is written to a temp file (<dest_path.tmp>) via os.write,
     then os.replace'd to the final path (without .tmp).
+
+Worker-side store path:
+    Each worker writes and fsyncs its rank slice to a unique temp file.
+    After all ranks report, workers atomically commit or abort their temps.
 
 Load path:
     Data is read from the block file directly via os.readv into the
@@ -16,7 +20,6 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 """
 
 import functools
-import json
 import os
 from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, ClassVar
@@ -39,8 +42,12 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.file_mapper import FileMapper
-from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
+from vllm.v1.kv_offload.tiering.async_lookup import (
+    AsyncLookupManager,
+    LookupState,
+)
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobResult,
@@ -48,6 +55,13 @@ from vllm.v1.kv_offload.tiering.base import (
     ScheduleEndContext,
     SecondaryTierManager,
     TransferJob,
+    WorkerTransferSpec,
+)
+from vllm.v1.kv_offload.tiering.fs.common import (
+    FileSystemControlSpec,
+    FileSystemLoadStoreSpec,
+    FileSystemLookupSpec,
+    ensure_config_file,
 )
 from vllm.v1.kv_offload.tiering.fs.gc_manager import FsGCManager
 from vllm.v1.kv_offload.tiering.fs.io import (
@@ -73,15 +87,52 @@ class FsAsyncLookupManager(AsyncLookupManager):
     ) -> None:
         super().__init__(tier_type=tier_type)
         self._tier = tier
+        self._worker_lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
+
+    def worker_lookup(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> bool | None:
+        state = self._lookup_state.get(key)
+        if state is None:
+            state = LookupState()
+            self._lookup_state[key] = state
+            self._worker_lookup_batch.append((key, req_context))
+        state.request_ids.add(req_context.req_id)
+        self._req_keys.setdefault(req_context.req_id, set()).add(key)
+        return state.result
+
+    def pop_worker_lookup_batch(
+        self,
+    ) -> tuple[ReqContext, list[OffloadKey]] | None:
+        if not self._worker_lookup_batch:
+            return None
+        pending = self._worker_lookup_batch
+        self._worker_lookup_batch = []
+        req_context = pending[0][1]
+        return req_context, [key for key, _ in pending]
+
+    def complete_worker_lookup(
+        self, keys: Iterable[OffloadKey], success: bool
+    ) -> None:
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = success
 
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
+        if self._tier.uses_worker_transfers():
+            raise RuntimeError("Worker-transfer fs lookups must run on workers")
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
+        return self._path_exists_batch(paths)
+
+    @staticmethod
+    def _path_exists_batch(paths: list[str]) -> list[bool]:
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+        return [os.path.exists(p) for p in paths]
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -123,6 +174,7 @@ class FileSystemTierManager(SecondaryTierManager):
         gc_stamp_interval_s: float = 60.0,
         gc_grace_s: float = 300.0,
         gc_max_tracked: int = 200_000,
+        worker_transfers: bool = False,
     ):
         """
         Args:
@@ -148,7 +200,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 a root_dir enforce the budget independently over the same
                 subtree and so evict each other's blocks, and blocks written
                 under a different layout fingerprint (a different <base_path>)
-                are never swept at all. Note that sweeps emit no removed=True KV
+                are never swept at all. GC is not supported when worker
+                transfers are enabled. Note that sweeps emit no removed=True KV
                 events (see FsGCManager for why), so with enable_kv_events an
                 external consumer must treat BlockStored as best-effort.
             gc_low_watermark: Fraction of gc_max_size_gb a sweep evicts down to,
@@ -162,6 +215,12 @@ class FileSystemTierManager(SecondaryTierManager):
             gc_max_tracked: Cap on keys tracked for the stamp rate limit.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
+        self._worker_transfers = worker_transfers or self._get_num_ranks() > 1
+        if self._worker_transfers and gc_max_size_gb is not None:
+            raise ValueError(
+                "gc_max_size_gb is not supported for worker-transfer fs tiers"
+            )
+
         self.locality = Locality(locality) if locality is not None else None
 
         self.events: list[OffloadingEvent] | None = None
@@ -203,14 +262,9 @@ class FileSystemTierManager(SecondaryTierManager):
             parallel_agnostic=True,
         )
 
-        # Write config file
-        config_path = self.file_mapper.get_config_file_path()
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
-                json.dump(
-                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
-                )
+        if not self._worker_transfers:
+            config_path = self.file_mapper.get_config_file_path()
+            ensure_config_file(config_path, self.file_mapper.get_run_config())
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -231,10 +285,11 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._worker_lookup_job_keys: dict[JobId, list[OffloadKey]] = {}
 
         self._gc_manager: FsGCManager | None = None
         self._gc_job_keys: dict[JobId, list[OffloadKey]] = {}
-        if gc_max_size_gb is not None:
+        if not self._worker_transfers and gc_max_size_gb is not None:
             self._gc_manager = FsGCManager(
                 self.file_mapper,
                 max_bytes=int(gc_max_size_gb * 2**30),
@@ -251,13 +306,139 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        result = self._lookup_manager.lookup(key, req_context)
+        if self._worker_transfers:
+            result = self._lookup_manager.worker_lookup(key, req_context)
+        else:
+            result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    def uses_worker_transfers(self) -> bool:
+        return self._worker_transfers
+
+    def _get_num_ranks(self) -> int:
+        num_ranks = self._offloading_spec.config.parallel.world_size
+        if num_ranks <= 0:
+            raise ValueError(f"Invalid parallel world size: {num_ranks}")
+        return num_ranks
+
+    def get_lookup_paths(self, key: OffloadKey) -> list[str]:
+        return [self.file_mapper.get_file_name(key, rank=rank) for rank in range(self._get_num_ranks())]
+
+    def _get_temp_path(self, final_path: str, job_id: int) -> str:
+        instance_id = self._offloading_spec.config.engine_id
+        return f"{final_path}.{instance_id}.{job_id}.tmp"
+
+    @override
+    def build_worker_store_transfer(
+        self, job_metadata: TransferJob
+    ) -> tuple[CPULoadStoreSpec, FileSystemLoadStoreSpec]:
+        num_ranks = self._get_num_ranks()
+        all_final = [
+            self.file_mapper.get_file_name(key, rank=rank)
+            for rank in range(num_ranks)
+            for key in job_metadata.keys
+        ]
+        all_temp = [self._get_temp_path(path, job_metadata.job_id) for path in all_final]
+        return (
+            CPULoadStoreSpec([int(b) for b in job_metadata.block_ids]),
+            FileSystemLoadStoreSpec(
+                file_paths=all_final, temp_file_paths=all_temp,
+                block_size=self._block_size, num_ranks=num_ranks,
+                config_path=self.file_mapper.get_config_file_path(),
+                run_config=self.file_mapper.get_run_config(),
+            ),
+        )
+
+    @override
+    def build_worker_load_transfer(
+        self, job_metadata: TransferJob
+    ) -> tuple[FileSystemLoadStoreSpec, CPULoadStoreSpec]:
+        num_ranks = self._get_num_ranks()
+        all_final = [
+            self.file_mapper.get_file_name(key, rank=rank)
+            for rank in range(num_ranks)
+            for key in job_metadata.keys
+        ]
+        return (
+            FileSystemLoadStoreSpec(
+                file_paths=all_final, block_size=self._block_size,
+                num_ranks=num_ranks, config_path=self.file_mapper.get_config_file_path(),
+                run_config=self.file_mapper.get_run_config(),
+            ),
+            CPULoadStoreSpec([int(b) for b in job_metadata.block_ids]),
+        )
+
+    def pop_worker_lookup_jobs(self, allocate_job_id) -> dict[JobId, WorkerTransferSpec]:
+        batch = self._lookup_manager.pop_worker_lookup_batch()
+        if batch is None:
+            return {}
+        req_context, keys = batch
+        num_ranks = self._get_num_ranks()
+        jobs: dict[JobId, WorkerTransferSpec] = {}
+        for key in keys:
+            job_id = allocate_job_id()
+            self._worker_lookup_job_keys[job_id] = [key]
+            spec = FileSystemLookupSpec(
+                file_paths=[self.file_mapper.get_file_name(key, rank=rank) for rank in range(num_ranks)],
+                block_size=self._block_size, num_ranks=num_ranks,
+                config_path=self.file_mapper.get_config_file_path(),
+                run_config=self.file_mapper.get_run_config(),
+            )
+            jobs[job_id] = WorkerTransferSpec(
+                req_id=req_context.req_id, src_spec=spec, dst_spec=spec,
+                operation="lookup",
+            )
+        return jobs
+
+    def complete_worker_lookup(self, job_id: JobId, success: bool) -> None:
+        keys = self._worker_lookup_job_keys.pop(job_id)
+        self._lookup_manager.complete_worker_lookup(keys, success)
+
+    @override
+    def begin_worker_transfer_completion(
+        self, job_metadata: TransferJob, success: bool
+    ) -> WorkerTransferSpec | None:
+        if job_metadata.is_promotion:
+            return None
+        _, dst_spec = self.build_worker_store_transfer(job_metadata)
+        assert dst_spec.temp_file_paths is not None
+        control_spec = FileSystemControlSpec(
+            action="commit" if success else "abort",
+            file_paths=dst_spec.file_paths, temp_file_paths=dst_spec.temp_file_paths,
+            block_size=dst_spec.block_size, num_ranks=dst_spec.num_ranks,
+            config_path=dst_spec.config_path, run_config=dst_spec.run_config,
+        )
+        return WorkerTransferSpec(
+            req_id=job_metadata.req_context.req_id,
+            src_spec=control_spec, dst_spec=control_spec,
+            operation=control_spec.action,
+        )
+
+    @override
+    def complete_worker_store(self, job_metadata: TransferJob, success: bool) -> None:
+        if success:
+            keys = list(job_metadata.keys)
+            self._lookup_manager.mark_present(keys)
+            if self.events is not None:
+                self.events.append(OffloadingEvent(
+                    keys=keys, medium=self.medium, removed=False, locality=self.locality
+                ))
+
+    @override
+    def complete_worker_load(self, job_metadata: TransferJob, success: bool) -> None:
+        if not success:
+            self._lookup_manager.mark_miss(job_metadata.keys)
+
+    @override
+    def abort_worker_transfers(self) -> None:
+        return
+
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
+        if self._worker_transfers:
+            raise RuntimeError("Scheduler-side filesystem stores are disabled for worker-transfer tiers")
         keys = list(job_metadata.keys)
         self._store_job_keys[job_metadata.job_id] = keys
         self._gc_protect(job_metadata)
@@ -273,9 +454,9 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        if self._worker_transfers:
+            raise RuntimeError("Scheduler-side filesystem loads are disabled for worker-transfer tiers")
         job_id = job_metadata.job_id
-        # Track this load's keys so a failed promotion can mark only its failed
-        # keys as a miss (see get_finished_jobs).
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
         self._gc_protect(job_metadata)
@@ -378,7 +559,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
-        self._lookup_manager.flush()
+        if not self._worker_transfers:
+            self._lookup_manager.flush()
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -389,7 +571,7 @@ class FileSystemTierManager(SecondaryTierManager):
         primary tier, which never read this tier's files and would otherwise age
         out while still hot. No-op unless a GC budget is configured.
         """
-        if self._gc_manager is not None:
+        if not self._worker_transfers and self._gc_manager is not None:
             self._gc_manager.touch(keys)
 
     def _gc_protect(self, job_metadata: TransferJob) -> None:
