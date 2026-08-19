@@ -448,6 +448,47 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _get_num_new_tokens(self, request: Request, token_budget: int) -> int:
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+        num_new_tokens = min(num_new_tokens, token_budget)
+
+        # Make sure the input position does not exceed the max model len.
+        # This is necessary when using spec decoding.
+        num_new_tokens = min(
+            num_new_tokens,
+            self.max_model_len
+            - request.num_computed_tokens
+            - self.num_sampled_tokens_per_step,
+        )
+
+        if self.need_mamba_block_aligned_split:
+            num_new_tokens = self._mamba_block_aligned_split(request, num_new_tokens)
+        return num_new_tokens
+
+    def _is_ready_decode(self, request: Request) -> bool:
+        if request.is_prefill_chunk:
+            return False
+        if (
+            request.num_output_placeholders > 0
+            and request.num_computed_tokens + 2 - request.num_output_placeholders
+            >= request.num_prompt_tokens + request.max_tokens
+        ):
+            return False
+        if self.current_step < request.next_decode_eligible_step:
+            return False
+        return self._get_num_new_tokens(request, self.max_num_scheduled_tokens) > 0
+
+    @staticmethod
+    def _prioritize_ready_decodes(running: list[Request]) -> None:
+        """Keep FCFS order within each stage while scheduling decodes first."""
+        running.sort(key=lambda request: request.is_prefill_chunk)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -486,16 +527,52 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # Stable stage ordering preserves FCFS within each stage. When at least
+        # one request is ready to decode, keep already-running prefill chunks
+        # out of most model steps: the B12X mixed running path otherwise reduces
+        # productive decode while long chunks consume the remaining budget.
+        # A bounded release cadence prevents one long decode from freezing
+        # running prefills or free request slots. This mode is opt-in so the
+        # default scheduler and the independent DP prefill cadence are unchanged.
+        decode_burst_steps = self.scheduler_config.fcfs_decode_burst_steps
+        decode_burst_enabled = (
+            self.policy == SchedulingPolicy.FCFS and decode_burst_steps > 0
+        )
+        decode_burst_release = decode_burst_enabled and (
+            self.current_step % (decode_burst_steps + 1) == 0
+        )
+
+        # DP prefill balancing normally defers all prefill compute on a
+        # throttled step unless the preceding release was capacity-bound. An
+        # opt-in FCFS burst release takes precedence so aligned cadences cannot
+        # suppress every bounded prefill release.
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
+            throttle_prefills
+            and not decode_burst_release
+            and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+
+        decode_priority_step = (
+            decode_burst_enabled
+            and not decode_burst_release
+            and not self.prefill_capacity_bound
+            and any(self._is_ready_decode(request) for request in self.running)
+        )
+        running_fcfs_order: dict[str, int] | None = None
+        if decode_priority_step:
+            running_fcfs_order = {
+                request.request_id: index for index, request in enumerate(self.running)
+            }
+            self._prioritize_ready_decodes(self.running)
 
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if decode_priority_step and request.is_prefill_chunk:
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -525,29 +602,7 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
-
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
-
-            # Apply Mamba alignment before encoder caps.
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
+            num_new_tokens = self._get_num_new_tokens(request, token_budget)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -694,6 +749,17 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        # Decode-first ordering is per-step only. Restore the original FCFS
+        # order before admission and before the next bounded release; otherwise
+        # a priority step could permanently leave older running prefills behind
+        # enough decodes to consume every later release budget.
+        if running_fcfs_order is not None:
+            self.running.sort(
+                key=lambda request: running_fcfs_order.get(
+                    request.request_id, len(running_fcfs_order)
+                )
+            )
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -704,8 +770,14 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # Next, schedule the WAITING requests. Decode-priority steps protect the
+        # running batch from mixed prefill; bounded release steps restore normal
+        # admission so a long decode cannot freeze every free request slot.
+        if (
+            not decode_priority_step
+            and not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:

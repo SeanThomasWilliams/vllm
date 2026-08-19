@@ -462,13 +462,266 @@ def test_throttle_prefills_defers_remote_kv_resume_with_local_prefill():
     assert "r1" in output.num_scheduled_tokens
 
 
+def _decode_model_runner_output(
+    requests: list[Request], token_id: int
+) -> ModelRunnerOutput:
+    req_ids = [request.request_id for request in requests]
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={request_id: i for i, request_id in enumerate(req_ids)},
+        sampled_token_ids=[[token_id] for _ in requests],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_fcfs_decode_priority_disabled_preserves_mixed_fcfs_step():
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+    )
+    assert scheduler.scheduler_config.fcfs_decode_burst_steps == 0
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output([decode_req], token_id=1000),
+    )
+
+    (waiting_req,) = create_requests(num_requests=1, num_tokens=80, req_ids=["wait0"])
+    scheduler.add_request(waiting_req)
+    output = scheduler.schedule()
+
+    assert "dec0" in output.num_scheduled_tokens
+    assert "wait0" in output.num_scheduled_tokens
+
+
+def test_fcfs_decode_priority_releases_waiting_on_prefill_cadence():
+    """A surviving decode must not freeze every request behind it.
+
+    B12X decode-priority steps defer prefills, but the configured release
+    cadence must bound queue delay and admit waiting work into a free slot.
+    """
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        fcfs_decode_burst_steps=2,
+    )
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert decode_req in scheduler.running and not decode_req.is_prefill_chunk
+
+    (waiting_req,) = create_requests(num_requests=1, num_tokens=80, req_ids=["wait0"])
+    scheduler.add_request(waiting_req)
+
+    output = scheduler.schedule()  # step 2: protect the running decode
+    assert "dec0" in output.num_scheduled_tokens
+    assert "wait0" not in output.num_scheduled_tokens
+    assert waiting_req in scheduler.waiting
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    output = scheduler.schedule()  # step 3: bounded prefill release
+    assert "dec0" in output.num_scheduled_tokens
+    assert "wait0" in output.num_scheduled_tokens
+    assert waiting_req in scheduler.running
+    assert not scheduler.waiting
+
+
+@pytest.mark.parametrize(
+    "ineligible_reason", ["cooldown", "placeholder_limit", "pp_inflight_no_work"]
+)
+def test_fcfs_decode_priority_ignores_ineligible_decode(ineligible_reason: str):
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        fcfs_decode_burst_steps=2,
+    )
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    if ineligible_reason == "cooldown":
+        decode_req.next_decode_eligible_step = scheduler.current_step + 10
+    elif ineligible_reason == "placeholder_limit":
+        decode_req.num_output_placeholders = 1
+        decode_req.num_computed_tokens = (
+            decode_req.num_prompt_tokens + decode_req.max_tokens - 1
+        )
+    else:
+        # PP can account for all currently-known tokens before the prior stage
+        # has delivered output. Such a row is decode-shaped but has zero work.
+        decode_req.num_computed_tokens = decode_req.num_tokens_with_spec
+
+    (waiting_req,) = create_requests(num_requests=1, num_tokens=20, req_ids=["wait0"])
+    scheduler.add_request(waiting_req)
+    output = scheduler.schedule()
+
+    assert "dec0" not in output.num_scheduled_tokens
+    assert "wait0" in output.num_scheduled_tokens
+    assert waiting_req in scheduler.running
+
+
+def test_fcfs_release_overrides_aligned_dp_throttle():
+    """A DP throttle aligned with every burst release cannot starve prefills."""
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        fcfs_decode_burst_steps=1,
+    )
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output([decode_req], token_id=1000),
+    )
+
+    (chunk_req,) = create_requests(num_requests=1, num_tokens=80, req_ids=["chk0"])
+    scheduler.add_request(chunk_req)
+    output = scheduler.schedule(throttle_prefills=True)  # step 2: release
+    assert "chk0" in output.num_scheduled_tokens
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0", "chk0"],
+            req_id_to_index={"dec0": 0, "chk0": 1},
+            sampled_token_ids=[[0], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert chunk_req.is_prefill_chunk
+
+    output = scheduler.schedule(throttle_prefills=True)  # step 3: priority
+    assert "chk0" not in output.num_scheduled_tokens
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output([decode_req], token_id=1001),
+    )
+
+    (waiting_req,) = create_requests(num_requests=1, num_tokens=20, req_ids=["wait0"])
+    scheduler.add_request(waiting_req)
+    output = scheduler.schedule(throttle_prefills=True)  # step 4: release
+    assert "chk0" in output.num_scheduled_tokens
+    assert "wait0" in output.num_scheduled_tokens
+
+
+def test_fcfs_decode_priority_restores_running_order_for_release():
+    """Decode-first ordering is temporary; releases retain older FCFS prefills."""
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        fcfs_decode_burst_steps=2,
+    )
+
+    decode_reqs = create_requests(
+        num_requests=2, num_tokens=4, req_ids=["dec0", "dec1"]
+    )
+    for request in decode_reqs:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output(decode_reqs, token_id=1000),
+    )
+
+    (chunk_req,) = create_requests(num_requests=1, num_tokens=80, req_ids=["chk0"])
+    scheduler.add_request(chunk_req)
+    output = scheduler.schedule()  # step 2: decode priority
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output(decode_reqs, token_id=1001),
+    )
+    output = scheduler.schedule()  # step 3: release starts the long prefill
+    assert "chk0" in output.num_scheduled_tokens
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0", "dec1", "chk0"],
+            req_id_to_index={"dec0": 0, "dec1": 1, "chk0": 2},
+            sampled_token_ids=[[0], [0], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert chunk_req.is_prefill_chunk
+
+    # Model the older-prefill FCFS order that a prior priority step must not
+    # destroy, then constrain the next release so two decodes could fill it.
+    scheduler.running[:] = [chunk_req, *decode_reqs]
+    scheduler.max_num_scheduled_tokens = 2
+    output = scheduler.schedule()  # step 4: decode priority
+    assert "chk0" not in output.num_scheduled_tokens
+    assert [request.request_id for request in scheduler.running] == [
+        "chk0",
+        "dec0",
+        "dec1",
+    ]
+    scheduler.update_from_output(
+        output,
+        _decode_model_runner_output(decode_reqs, token_id=1002),
+    )
+
+    scheduler.current_step = 5
+    output = scheduler.schedule()  # step 6: release
+    assert output.num_scheduled_tokens == {"chk0": 2}
+
+
 def test_throttle_defers_inflight_prefill_chunk():
     """DP prefill balancing throttles ALL prefill compute on a throttled step,
     not just new admissions: an in-progress (chunked) prefill already in the
     running queue is also deferred, so the step runs decode-only, while a
     separate decode keeps being scheduled."""
     scheduler = create_scheduler(
-        max_num_seqs=16, max_num_batched_tokens=50, enable_chunked_prefill=True
+        max_num_seqs=16,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        fcfs_decode_burst_steps=1,
     )
 
     # A short request that finishes prefill in one step -> a running decode.
@@ -491,7 +744,7 @@ def test_throttle_defers_inflight_prefill_chunk():
     # A long request (80 tokens, budget 50) -> prefilled in chunks.
     (chunk_req,) = create_requests(num_requests=1, num_tokens=80, req_ids=["chk0"])
     scheduler.add_request(chunk_req)
-    output = scheduler.schedule()  # first chunk of chk0 + decode of dec0
+    output = scheduler.schedule()  # release step: first chk0 chunk + dec0
     assert output.num_scheduled_tokens["chk0"] > 0
     scheduler.update_from_output(
         output,

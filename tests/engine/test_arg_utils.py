@@ -206,6 +206,14 @@ def test_get_kwargs():
     assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
 
 
+def test_fcfs_decode_burst_steps_arg():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--fcfs-decode-burst-steps", "15"])
+
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.fcfs_decode_burst_steps == 15
+
+
 def test_jit_monitor_verbose_arg():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(["--jit-monitor-verbose"])
