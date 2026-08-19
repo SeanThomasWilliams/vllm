@@ -9,8 +9,41 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+def _build_grammar_mapping(
+    req_ids: list[str],
+    grammar_req_ids: list[str],
+    cu_num_logits_np: np.ndarray,
+    num_draft_tokens_per_req: np.ndarray | None,
+    num_bonus_tokens: int,
+    mask_stride: int,
+) -> list[int]:
+    mapping: list[int] = []
+    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+    for grammar_req_id in grammar_req_ids:
+        req_idx = req_id_to_idx[grammar_req_id]
+        if num_draft_tokens_per_req is None:
+            num_positions = int(
+                cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
+            )
+        else:
+            # Grammar masks follow the scheduled layout even when capacity
+            # verification compacts the actual logits to bonus-only rows.
+            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
+        mapping.extend(
+            req_idx * mask_stride + position for position in range(num_positions)
+        )
+    return mapping
+
+
 class StructuredOutputsWorker:
-    def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
+    def __init__(
+        self,
+        max_num_logits: int,
+        vocab_size: int,
+        device: torch.device,
+        mask_stride: int,
+        num_bonus_tokens: int,
+    ):
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
         )
@@ -19,6 +52,8 @@ class StructuredOutputsWorker:
         )
         self.device = device
         self.copy_stream = torch.cuda.Stream()
+        self.mask_stride = mask_stride
+        self.num_bonus_tokens = num_bonus_tokens
 
     def apply_grammar_bitmask(
         self,
@@ -36,16 +71,17 @@ class StructuredOutputsWorker:
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
 
-        # Construct bitmask -> logits mapping
-        mapping: list[int] = []
-        req_ids = input_batch.req_ids
-        cu_num_logits = input_batch.cu_num_logits_np.tolist()
-        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
-        for grammar_req_id in grammar_req_ids:
-            req_idx = req_id_to_idx[grammar_req_id]
-            logits_start_idx = cu_num_logits[req_idx]
-            logits_end_idx = cu_num_logits[req_idx + 1]
-            mapping.extend(range(logits_start_idx, logits_end_idx))
+        # Construct bitmask -> logits mapping keyed by request and position.
+        # Capacity verification can compact the device logits after the grammar
+        # bitmask has been built from the scheduled draft layout.
+        mapping = _build_grammar_mapping(
+            input_batch.req_ids,
+            grammar_req_ids,
+            input_batch.cu_num_logits_np,
+            input_batch.num_draft_tokens_per_req,
+            self.num_bonus_tokens,
+            self.mask_stride,
+        )
 
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
@@ -69,9 +105,11 @@ class StructuredOutputsWorker:
             logits,
             logits.stride(0),
             logits_indices,
+            input_batch.cu_num_logits,
             bitmask,
             bitmask.stride(0),
             vocab_size,
+            MASK_STRIDE=self.mask_stride,
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
@@ -87,13 +125,21 @@ def _apply_grammar_bitmask_kernel(
     logits_ptr,
     logits_stride,
     logits_indices_ptr,
+    cu_num_logits_ptr,
     bitmask_ptr,
     bitmask_stride,
     vocab_size,
+    MASK_STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     bitmask_idx = tl.program_id(0)
-    logits_idx = tl.load(logits_indices_ptr + bitmask_idx)
+    mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
+    req_idx = mapping_idx // MASK_STRIDE
+    position_idx = mapping_idx % MASK_STRIDE
+    logits_idx = tl.load(cu_num_logits_ptr + req_idx)
+    num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
+    logits_idx += position_idx
+    position_is_active = position_idx < num_req_logits
 
     # Load the bitmask.
     block_id = tl.program_id(1)
@@ -111,5 +157,5 @@ def _apply_grammar_bitmask_kernel(
     tl.store(
         logits_ptr + logits_idx * logits_stride + block_offset,
         -float("inf"),
-        mask=bitmask & (block_offset < vocab_size),
+        mask=position_is_active & bitmask & (block_offset < vocab_size),
     )
