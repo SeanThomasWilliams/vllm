@@ -69,6 +69,16 @@ class TransferJob:
 
 
 @dataclass
+class WorkerTransferSpec:
+    """Worker-visible description of a secondary-tier operation."""
+
+    req_id: str
+    src_spec: LoadStoreSpec
+    dst_spec: LoadStoreSpec
+    operation: str = "transfer"
+
+
+@dataclass
 class JobResult:
     """Result of an async transfer job."""
 
@@ -211,9 +221,7 @@ class SecondaryTierManager(ABC):
     ) -> tuple[LoadStoreSpec, LoadStoreSpec]:
         raise NotImplementedError
 
-    def complete_worker_store(
-        self, job_metadata: TransferJob, success: bool
-    ) -> None:
+    def complete_worker_store(self, job_metadata: TransferJob, success: bool) -> None:
         return
 
     def begin_worker_transfer_completion(
@@ -235,6 +243,10 @@ class SecondaryTierManager(ABC):
 
     def complete_worker_load(self, job_metadata: TransferJob, success: bool) -> None:
         """Finalize a worker-executed secondary -> primary transfer."""
+        return
+
+    def complete_worker_lookup(self, job_id: JobId, success: bool) -> None:
+        """Finalize a worker-executed secondary-tier lookup."""
         return
 
     def abort_worker_transfers(self) -> None:

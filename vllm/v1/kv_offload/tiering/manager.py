@@ -21,7 +21,7 @@ Key Design Principles:
 """
 
 import time
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -234,7 +234,9 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._jobs: dict[JobId, JobMetadata] = {}
-        self._worker_transfer_jobs: dict[JobId, tuple[SecondaryTierManager, TransferJob]] = {}
+        self._worker_transfer_jobs: dict[
+            JobId, tuple[SecondaryTierManager, TransferJob]
+        ] = {}
         self._worker_lookup_tiers: dict[JobId, SecondaryTierManager] = {}
         self._worker_control_states: dict[
             JobId, tuple[SecondaryTierManager, TransferJob, bool, str, int]
@@ -275,7 +277,10 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
-        while self._job_id_counter in self._transfer_jobs or self._job_id_counter in self._worker_transfer_jobs:
+        while (
+            self._job_id_counter in self._transfer_jobs
+            or self._job_id_counter in self._worker_transfer_jobs
+        ):
             self._job_id_counter += 1
         job_id = self._job_id_counter
         self._job_id_counter += 1
@@ -287,6 +292,7 @@ class TieringOffloadingManager(OffloadingManager):
             if job_id not in self._jobs and job_id not in self._worker_transfer_jobs:
                 self._job_id_counter = max(self._job_id_counter, job_id + 1)
                 return job_id
+
     def _register_job(self, transfer_job: TransferJob, tier_idx: int) -> None:
         job_metadata = JobMetadata(transfer_job, tier_idx)
         self._jobs[transfer_job.job_id] = job_metadata
@@ -294,7 +300,6 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _pop_job(self, job_id: JobId) -> JobMetadata | None:
         return self._jobs.pop(job_id, None)
-
 
     def _maybe_process_finished_jobs(self):
         """
@@ -424,8 +429,11 @@ class TieringOffloadingManager(OffloadingManager):
         for pending in self._pending_worker_transfers:
             job_id = self._reserve_worker_job_id(allocate_job_id)
             job = TransferJob(
-                job_id=job_id, keys=pending.keys, block_ids=pending.block_ids,
-                is_promotion=pending.is_promotion, req_context=pending.req_context,
+                job_id=job_id,
+                keys=pending.keys,
+                block_ids=pending.block_ids,
+                is_promotion=pending.is_promotion,
+                req_context=pending.req_context,
             )
             if pending.is_promotion:
                 src_spec, dst_spec = pending.tier.build_worker_load_transfer(job)
@@ -433,7 +441,8 @@ class TieringOffloadingManager(OffloadingManager):
                 src_spec, dst_spec = pending.tier.build_worker_store_transfer(job)
             self._worker_transfer_jobs[job_id] = (pending.tier, job)
             jobs[job_id] = WorkerTransferSpec(
-                req_id=pending.req_context.req_id, src_spec=src_spec,
+                req_id=pending.req_context.req_id,
+                src_spec=src_spec,
                 dst_spec=dst_spec,
                 operation="load" if pending.is_promotion else "store",
             )
@@ -459,7 +468,13 @@ class TieringOffloadingManager(OffloadingManager):
         tier, job = self._worker_transfer_jobs[job_id]
         control = tier.begin_worker_transfer_completion(job, success)
         if control is not None:
-            self._worker_control_states[job_id] = (tier, job, success, control.operation, 0)
+            self._worker_control_states[job_id] = (
+                tier,
+                job,
+                success,
+                control.operation,
+                0,
+            )
             return control
         self._worker_transfer_jobs.pop(job_id)
         if job.is_promotion:
@@ -485,39 +500,79 @@ class TieringOffloadingManager(OffloadingManager):
     def complete_worker_control(
         self, job_id: JobId, success: bool
     ) -> WorkerTransferSpec | None:
-        tier, job, initial_success, operation, retries = self._worker_control_states[job_id]
+        tier, job, initial_success, operation, retries = self._worker_control_states[
+            job_id
+        ]
         if operation == "commit":
             if not success:
                 control = tier.begin_worker_transfer_completion(job, False)
                 assert control is not None
-                self._worker_control_states[job_id] = (tier, job, False, control.operation, 0)
+                self._worker_control_states[job_id] = (
+                    tier,
+                    job,
+                    False,
+                    control.operation,
+                    0,
+                )
                 return control
             control = tier.begin_worker_transfer_release(job)
             if control is not None:
-                self._worker_control_states[job_id] = (tier, job, initial_success, control.operation, 0)
+                self._worker_control_states[job_id] = (
+                    tier,
+                    job,
+                    initial_success,
+                    control.operation,
+                    0,
+                )
                 return control
         elif operation == "release":
             if not success:
                 control = tier.begin_worker_transfer_completion(job, False)
                 if control is not None:
-                    self._worker_control_states[job_id] = (tier, job, False, control.operation, 0)
+                    self._worker_control_states[job_id] = (
+                        tier,
+                        job,
+                        False,
+                        control.operation,
+                        0,
+                    )
                     return control
             else:
                 control = tier.begin_worker_transfer_finalize(job)
                 if control is not None:
-                    self._worker_control_states[job_id] = (tier, job, initial_success, control.operation, 0)
+                    self._worker_control_states[job_id] = (
+                        tier,
+                        job,
+                        initial_success,
+                        control.operation,
+                        0,
+                    )
                     return control
-        elif operation == "finalize" and not success and retries < _MAX_FINALIZE_RETRIES:
+        elif (
+            operation == "finalize" and not success and retries < _MAX_FINALIZE_RETRIES
+        ):
             control = tier.begin_worker_transfer_finalize(job)
             if control is not None:
-                self._worker_control_states[job_id] = (tier, job, initial_success, control.operation, retries + 1)
+                self._worker_control_states[job_id] = (
+                    tier,
+                    job,
+                    initial_success,
+                    control.operation,
+                    retries + 1,
+                )
                 return control
-            logger.warning("Finalize cleanup failed for worker transfer job %d; retaining published store", job_id)
+            logger.warning(
+                "Finalize cleanup failed for worker transfer job %d; "
+                "retaining published store",
+                job_id,
+            )
 
         self._worker_control_states.pop(job_id)
         self._worker_transfer_jobs.pop(job_id)
-        final_success = initial_success if operation == "finalize" else (
-            False if operation == "abort" else initial_success and success
+        final_success = (
+            initial_success
+            if operation == "finalize"
+            else (False if operation == "abort" else initial_success and success)
         )
         tier.complete_worker_store(job, final_success)
         self.primary_tier.complete_read(job.keys, job.req_context)

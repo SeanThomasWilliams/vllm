@@ -41,9 +41,7 @@ def _read_exact_at(fd: int, view: memoryview, offset: int) -> None:
     while read < len(view):
         chunk = os.pread(fd, len(view) - read, offset + read)
         if not chunk:
-            raise OSError(
-                f"Short read: expected {len(view)} bytes, read {read}"
-            )
+            raise OSError(f"Short read: expected {len(view)} bytes, read {read}")
         end = read + len(chunk)
         view[read:end] = chunk
         read = end
@@ -242,9 +240,7 @@ class FileSystemWorkerTransferHandler:
         self._pool.enqueue_load(job_id, len(dst_spec.block_ids), tasks)
         return True
 
-    def submit_lookup(
-        self, job_id: int, spec: FileSystemLookupSpec
-    ) -> bool:
+    def submit_lookup(self, job_id: int, spec: FileSystemLookupSpec) -> bool:
         self._ensure_config(spec)
         num_ranks = spec.num_ranks
         my_files = self._select_rank_paths(spec.file_paths, num_ranks)
@@ -270,9 +266,7 @@ class FileSystemWorkerTransferHandler:
         )
         return True
 
-    def submit_control(
-        self, job_id: int, spec: FileSystemControlSpec
-    ) -> bool:
+    def submit_control(self, job_id: int, spec: FileSystemControlSpec) -> bool:
         self._ensure_config(spec)
         my_final = self._select_rank_paths(spec.file_paths, spec.num_ranks)
         my_temp = self._select_rank_paths(spec.temp_file_paths, spec.num_ranks)
@@ -342,13 +336,7 @@ class FileSystemWorkerTransferHandler:
             return
 
         os.makedirs(os.path.dirname(temp_path) or ".", exist_ok=True)
-        flags = (
-            os.O_CREAT
-            | os.O_EXCL
-            | os.O_RDWR
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW
-        )
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         fd = os.open(temp_path, flags, 0o600)
         try:
             os.ftruncate(fd, block_size + _DIGEST_SIZE)
@@ -446,9 +434,7 @@ class FileSystemWorkerTransferHandler:
         """Acknowledge cleanup without touching a published final file."""
         del final_path, temp_path, block_size
 
-    def _load_one(
-        self, *, source_path: str, block_id: int, block_size: int
-    ) -> None:
+    def _load_one(self, *, source_path: str, block_id: int, block_size: int) -> None:
         fd = _open_validated_block(source_path, block_size)
         try:
             offset = self._rank_offset
@@ -463,7 +449,7 @@ class FileSystemWorkerTransferHandler:
     def get_finished(self) -> list[TransferResult]:
         results = self._lookup_results
         self._lookup_results = []
-        for job_id, success in self._pool.get_finished():
+        for job_id, success, transfer_time in self._pool.get_finished():
             action = self._control_jobs.pop(job_id, None)
             if action is not None:
                 self._cleanup_store_temps({job_id})
@@ -476,7 +462,7 @@ class FileSystemWorkerTransferHandler:
                     job_id=job_id,
                     success=success,
                     transfer_size=None,
-                    transfer_time=None,
+                    transfer_time=transfer_time,
                 )
             )
         return results

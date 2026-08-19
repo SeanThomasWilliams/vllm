@@ -572,8 +572,8 @@ class OffloadingWorker(ABC):
         if isinstance(dst_spec, GPULoadStoreSpec):
             return self.submit_load(job_id, src_spec, dst_spec)
         raise NotImplementedError(
-            f"Unsupported worker transfer {src_spec.medium()} -> "
-            f"{dst_spec.medium()}"
+            "Unsupported worker transfer "
+            f"{type(src_spec).__name__} -> {type(dst_spec).__name__}"
         )
 
     @abstractmethod

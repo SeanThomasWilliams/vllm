@@ -176,6 +176,9 @@ class OffloadingConnectorWorker:
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
+        canonical_tensor_indices: dict[
+            tuple[int, int, tuple[int, ...], tuple[int, ...]], int
+        ] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # Filter to layers that were actually processed above.
             # Packed KV allocation emits KVCacheTensor entries for
@@ -188,32 +191,33 @@ class OffloadingConnectorWorker:
             if not tensor_layer_names:
                 continue
 
-            # verify all layers in the group reference the exact same tensors
+            # Layers normally alias the same view, but a KVCacheTensor can
+            # describe layers at different offsets in a shared allocation.
+            # Canonicalize each distinct view and let each layer reference its
+            # own canonical tensor instead of requiring pointer equality.
             assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
-
-            # pick the first layer to represent the group
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
+            for layer_name in tensor_layer_names:
+                layer_tensors = tensors_per_block[layer_name]
+                for tensor in layer_tensors:
+                    tensor_key = (
+                        tensor.data_ptr(),
+                        tensor.storage_offset(),
+                        tuple(tensor.shape),
+                        tuple(tensor.stride()),
                     )
-                )
+                    tensor_idx = canonical_tensor_indices.get(tensor_key)
+                    if tensor_idx is None:
+                        tensor_idx = len(block_tensors)
+                        canonical_tensor_indices[tensor_key] = tensor_idx
+                        block_tensors.append(
+                            CanonicalKVCacheTensor(
+                                tensor=tensor,
+                                page_size_bytes=page_size_bytes[layer_name],
+                            )
+                        )
 
-                curr_tensor_idx = len(block_tensors) - 1
-                for layer_name in tensor_layer_names:
                     mapping = (
-                        mappings.get(layer_name)
-                        if len(tensors_per_block[first_layer_name]) == 1
-                        else None
+                        mappings.get(layer_name) if len(layer_tensors) == 1 else None
                     )
                     assert (
                         mapping is None
@@ -222,8 +226,8 @@ class OffloadingConnectorWorker:
                     )
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
-                            tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            tensor_idx=tensor_idx,
+                            page_size_bytes=unpadded_page_size_bytes[layer_name],
                             mapping=mapping,
                         )
                     )
@@ -390,9 +394,7 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(
-                job_id, transfer_result.success
-            )
+            self._connector_worker_meta.mark_completed(job_id, transfer_result.success)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None and transfer_result.success:
                 finished_recving.add(req_id)
