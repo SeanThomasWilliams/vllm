@@ -390,28 +390,30 @@ class FileSystemTierManager(SecondaryTierManager):
             return {}
         req_context, keys = batch
         num_ranks = self._get_num_ranks()
-        job_id = allocate_job_id()
-        self._worker_lookup_job_keys[job_id] = keys
-        file_paths = [
-            self.file_mapper.get_file_name(key, rank=rank)
-            for rank in range(num_ranks)
-            for key in keys
-        ]
-        spec = FileSystemLookupSpec(
-            file_paths=file_paths,
-            block_size=self._block_size,
-            num_ranks=num_ranks,
-            config_path=self.file_mapper.get_config_file_path(),
-            run_config=self.file_mapper.get_run_config(),
-        )
-        return {
-            job_id: WorkerTransferSpec(
+        jobs: dict[JobId, WorkerTransferSpec] = {}
+        # A lookup completion carries one boolean, so keep each key in its own
+        # job. Returning all jobs together still preserves one metadata
+        # collective for the scheduler step.
+        for key in keys:
+            job_id = allocate_job_id()
+            self._worker_lookup_job_keys[job_id] = [key]
+            spec = FileSystemLookupSpec(
+                file_paths=[
+                    self.file_mapper.get_file_name(key, rank=rank)
+                    for rank in range(num_ranks)
+                ],
+                block_size=self._block_size,
+                num_ranks=num_ranks,
+                config_path=self.file_mapper.get_config_file_path(),
+                run_config=self.file_mapper.get_run_config(),
+            )
+            jobs[job_id] = WorkerTransferSpec(
                 req_id=req_context.req_id,
                 src_spec=spec,
                 dst_spec=spec,
                 operation="lookup",
             )
-        }
+        return jobs
 
     def complete_worker_lookup(self, job_id: JobId, success: bool) -> None:
         keys = self._worker_lookup_job_keys.pop(job_id)

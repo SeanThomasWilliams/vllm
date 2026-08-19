@@ -997,7 +997,7 @@ def test_cascade_store_emits_fs_event_through_tiering_manager(tmp_path):
 
 
 def test_worker_lookup_batches_all_pending_keys(tmp_path):
-    """A scheduler step emits one worker lookup for all pending keys."""
+    """A scheduler step emits one worker lookup job per key in one batch."""
     tier = FileSystemTierManager(
         offloading_spec=_make_offloading_spec(tp_size=2, world_size=2),
         primary_kv_view=memoryview(
@@ -1013,18 +1013,76 @@ def test_worker_lookup_batches_all_pending_keys(tmp_path):
         assert all(
             tier.lookup(block_key, _CTX) is LookupResult.RETRY for block_key in keys
         )
-        jobs = tier.pop_worker_lookup_jobs(lambda: 17)
-        assert list(jobs) == [17]
-        spec = jobs[17].src_spec
-        assert isinstance(spec, FileSystemLookupSpec)
-        assert len(spec.file_paths) == 2 * len(keys)
-        assert tier._worker_lookup_job_keys[17] == keys
+        job_ids = iter(range(17, 20))
+        jobs = tier.pop_worker_lookup_jobs(lambda: next(job_ids))
+        assert list(jobs) == [17, 18, 19]
+        for job_id, block_key in zip(jobs, keys):
+            spec = jobs[job_id].src_spec
+            assert isinstance(spec, FileSystemLookupSpec)
+            assert len(spec.file_paths) == 2
+            assert tier._worker_lookup_job_keys[job_id] == [block_key]
 
-        tier.complete_worker_lookup(17, success=False)
+        for job_id in jobs:
+            tier.complete_worker_lookup(job_id, success=False)
         assert [tier.lookup(block_key, _CTX) for block_key in keys] == [
             LookupResult.MISS
         ] * len(keys)
     finally:
+        tier.shutdown()
+
+
+def test_worker_lookup_mixed_persisted_hit_and_miss(tmp_path):
+    """Worker lookup keeps an older persisted hit beside a newest-key miss."""
+    tensor = _page_aligned_zero_tensor(2, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(tp_size=1, world_size=1),
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        worker_transfers=True,
+    )
+    handler = FileSystemWorkerTransferHandler(
+        [tensor], rank=0, n_read_threads=1, n_write_threads=1
+    )
+    try:
+        older, newest = key(1), key(2)
+        keys = [older, newest]
+        assert all(
+            tier.lookup(block_key, _CTX) is LookupResult.RETRY for block_key in keys
+        )
+        job_ids = iter((17, 18))
+        jobs = tier.pop_worker_lookup_jobs(lambda: next(job_ids))
+        assert len(jobs) == len(keys)
+
+        store_job = make_job(1, [older], [0])
+        src_spec, dst_spec = tier.build_worker_store_transfer(store_job)
+        handler.submit_store(store_job.job_id, src_spec, dst_spec)
+        handler.wait()
+        assert handler.get_finished()[0].success
+        control_spec = FileSystemControlSpec(
+            action="commit",
+            file_paths=dst_spec.file_paths,
+            temp_file_paths=dst_spec.temp_file_paths or [],
+            block_size=dst_spec.block_size,
+            num_ranks=dst_spec.num_ranks,
+            config_path=dst_spec.config_path,
+            run_config=dst_spec.run_config,
+        )
+        handler.submit_control(store_job.job_id, control_spec)
+        handler.wait()
+        assert handler.get_finished()[0].success
+
+        for job_id, block_key in zip(jobs, keys):
+            handler.submit_lookup(job_id, jobs[job_id].src_spec)
+            result = handler.get_finished()[0]
+            tier.complete_worker_lookup(job_id, result.success)
+            assert tier.lookup(block_key, _CTX) is (
+                LookupResult.HIT if block_key == older else LookupResult.MISS
+            )
+    finally:
+        handler.shutdown()
         tier.shutdown()
 
 
