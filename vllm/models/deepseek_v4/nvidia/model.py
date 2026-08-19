@@ -565,8 +565,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             is_padding=is_padding,
         )
 
-        # This method must have been already called during the weight loading phase.
-        # We call it again here to cover the dummy weight loading case.
+        # The model-level post-load hook normally prepares these tensors. Keep
+        # the lazy fallback for dummy-loading paths that bypass that hook.
         self.finalize_weights()
 
         assert self._transformed_l1_weights is not None
@@ -2076,10 +2076,13 @@ class DeepseekV4ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self.process_weights_after_loading()
+        return loaded_params
+
+    def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         self.model.setup_b12x_wo_projection()
-        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
