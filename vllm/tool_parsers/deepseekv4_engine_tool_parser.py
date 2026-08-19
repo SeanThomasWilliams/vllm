@@ -7,6 +7,8 @@ from vllm.parser.engine.registered_adapters import DeepSeekV4ParserToolAdapter
 
 class DeepSeekV4EngineToolParser(DeepSeekV4ParserToolAdapter):  # type: ignore[valid-type, misc]
     structural_tag_model = "deepseek_v4"
+    # Required and named requests still emit DSML, not standard JSON.
+    supports_required_and_named = False
     # DeepSeek occasionally emits a complete DSML block without closing
     # </think>; let DelegatingParser recover it from the reasoning channel.
     tool_call_start_token = DSML_TOOL_START

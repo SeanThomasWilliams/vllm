@@ -161,7 +161,9 @@ def test_function_calls_block_is_not_accepted():
     result = parser.extract_tool_calls(model_output, make_request())
 
     assert not result.tools_called
-    assert result.content == model_output
+    assert result.content == model_output.replace(
+        "</｜DSML｜", "&lt;/｜DSML｜"
+    ).replace("<｜DSML｜", "&lt;｜DSML｜")
 
 
 def test_streaming_extracts_complete_invokes():

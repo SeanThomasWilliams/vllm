@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 from vllm.config import VllmConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -9,6 +11,7 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages_async,
 )
 from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
+from vllm.tokenizers.hf import maybe_make_thread_pool
 from vllm.utils.async_utils import make_async
 
 from .base import BaseRenderer
@@ -23,7 +26,13 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         config: VllmConfig,
         tokenizer: DeepseekV4Tokenizer | None,
     ) -> None:
+        tokenizer = copy.copy(tokenizer)
         super().__init__(config, tokenizer)
+
+        if self.tokenizer is not None:
+            maybe_make_thread_pool(
+                self.tokenizer, config.model_config.renderer_num_workers + 1
+            )
 
         self._apply_chat_template_async = make_async(
             self._apply_chat_template, executor=self._executor

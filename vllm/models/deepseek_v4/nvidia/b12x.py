@@ -949,6 +949,11 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 if extra_topk_lens is not None
                 else None
             )
+            # Chunk planning can produce an empty query range when a request
+            # contributes no prefill tokens. B12X rejects zero-row compressed
+            # MLA launches, so skip the empty chunk before entering the kernel.
+            if query_start == query_end:
+                continue
             if dcp_world_size > 1:
                 _run_dcp_compressed_mla(
                     q=q[query_start:query_end],

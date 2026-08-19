@@ -8,7 +8,6 @@ import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
 from tests.parser.engine.replay_harness import (
-    DUMMY_TOOLS,
     MockTokenizer,
     _test_request,
     collect_output,
@@ -45,6 +44,21 @@ _THINK_END_ID = 51
 
 _PARAM_OPEN = '｜DSML｜parameter name="{name}" string="{is_str}">'
 _PARAM_CLOSE = "</｜DSML｜parameter>"
+_GET_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "units": {"type": "string"},
+                },
+            },
+        },
+    }
+]
 
 
 def _param(name: str, is_str: str, value: str) -> str:
@@ -839,7 +853,7 @@ class TestDelegatingParserLargeDelta:
             dsv4_tokens,
             chunk_size=chunk_size,
             finished_on_last=True,
-            tools=DUMMY_TOOLS,
+            tools=_GET_WEATHER_TOOLS,
         )
         output = collect_output(deltas)
 
@@ -869,7 +883,7 @@ class TestDelegatingParserLargeDelta:
             tokens,
             chunk_size=1,
             finished_on_last=True,
-            tools=DUMMY_TOOLS,
+            tools=_GET_WEATHER_TOOLS,
             prompt_token_ids=[_DSV4_FULL_VOCAB[DSML_THINK_START]],
         )
         output = collect_output(deltas)
@@ -934,7 +948,7 @@ class TestDelegatingParserLargeDelta:
 
         all_ids = [t[0] for t in tokens]
         tokenizer = MockTokenizer(vocab=vocab, tokens=tokens)
-        request = _test_request(tools=DUMMY_TOOLS)
+        request = _test_request(tools=_GET_WEATHER_TOOLS)
 
         # All-in-one delta: EOS ID in token_ids but text NOT in
         # delta_text (detokenizer strips EOS).  This is the scenario
