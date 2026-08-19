@@ -1052,8 +1052,11 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   if (bid >= num_rows) return;
 
-  const int length =
-      (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
+  const uint32_t raw_length =
+      (lengths != nullptr)
+          ? (lengths[bid] > 0 ? static_cast<uint32_t>(lengths[bid]) : 0u)
+          : max_len;
+  const int length = static_cast<int>(min(raw_length, max_len));
   const DType* score = input + bid * max_len;
   IdType* dst = output + bid * top_k;
 

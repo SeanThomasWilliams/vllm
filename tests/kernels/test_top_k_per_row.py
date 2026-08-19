@@ -17,20 +17,23 @@ DATA_GENERATION = ["random", "10LSBits"]
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
-def _is_device_capability_family(capability: int) -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        capability
+def _is_cooperative_topk_available() -> bool:
+    # Keep this in sync with sparse_attn_indexer.py and the optional C++ op.
+    return (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+        and not current_platform.is_device_capability_family(120)
+        and hasattr(torch.ops._C, "cooperative_topk")
     )
 
 
-# Match the production dispatch in sparse_attn_indexer.py: cooperative_topk is
-# an SM90-family path (it can launch-fail on SM120), so only test it there.
+# Match the production dispatch in sparse_attn_indexer.py, including the
+# optional build-time op registration.
 COOPERATIVE_TOPK_BACKEND = pytest.param(
     "cooperative_topk",
     marks=pytest.mark.skipif(
-        not _is_device_capability_family(90),
-        reason="cooperative_topk requires the SM90 family (matches production "
-        "dispatch)",
+        not _is_cooperative_topk_available(),
+        reason="cooperative_topk production predicate or op is unavailable",
     ),
 )
 WORKSPACE_TOPK_BACKENDS = ["persistent_topk", COOPERATIVE_TOPK_BACKEND]
@@ -809,8 +812,8 @@ def test_deepseek_topk_backends_no_error_and_reference(
 
 
 @pytest.mark.skipif(
-    not _is_device_capability_family(90),
-    reason="cooperative_topk requires the SM90 family (matches production dispatch)",
+    not _is_cooperative_topk_available(),
+    reason="cooperative_topk production predicate or op is unavailable",
 )
 @torch.inference_mode()
 def test_cooperative_topk_512_tie_workspace_is_per_row() -> None:
@@ -845,8 +848,8 @@ def test_cooperative_topk_512_tie_workspace_is_per_row() -> None:
 
 
 @pytest.mark.skipif(
-    not _is_device_capability_family(90),
-    reason="cooperative_topk requires the SM90 family (matches production dispatch)",
+    not _is_cooperative_topk_available(),
+    reason="cooperative_topk production predicate or op is unavailable",
 )
 @torch.inference_mode()
 def test_cooperative_topk_negative_length_is_padded() -> None:
@@ -865,11 +868,120 @@ def test_cooperative_topk_negative_length_is_padded() -> None:
     )
     torch.accelerator.synchronize()
 
-    assert torch.equal(indices[0].cpu(), torch.full((top_k,), -1, dtype=torch.int32))
+    assert torch.equal(
+        indices[0].cpu(),
+        torch.full((top_k,), -1, dtype=torch.int32, device="cpu"),
+    )
     assert set(indices[1, :4].cpu().tolist()) == set(range(4))
     assert torch.equal(
-        indices[1, 4:].cpu(), torch.full((top_k - 4,), -1, dtype=torch.int32)
+        indices[1, 4:].cpu(),
+        torch.full((top_k - 4,), -1, dtype=torch.int32, device="cpu"),
     )
+
+
+@pytest.mark.skipif(
+    not _is_cooperative_topk_available(),
+    reason="cooperative_topk production predicate or op is unavailable",
+)
+@torch.inference_mode()
+def test_cooperative_topk_over_width_length_is_padded() -> None:
+    """Cooperative top-k must not select indices beyond the row stride."""
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    stride = 16
+    logits = torch.arange(2 * stride, dtype=torch.float32, device="cuda").view(
+        2, stride
+    )
+    lengths = torch.tensor([stride + 5, 4], dtype=torch.int32, device="cuda")
+    indices = torch.empty((2, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "cooperative_topk", logits, lengths, indices, top_k, max_seq_len=stride
+    )
+    torch.accelerator.synchronize()
+
+    assert set(indices[0, :stride].cpu().tolist()) == set(range(stride))
+    assert torch.equal(
+        indices[0, stride:].cpu(),
+        torch.full((top_k - stride,), -1, dtype=torch.int32, device="cpu"),
+    )
+    assert set(indices[1, :4].cpu().tolist()) == set(range(4))
+    assert torch.equal(
+        indices[1, 4:].cpu(),
+        torch.full((top_k - 4,), -1, dtype=torch.int32, device="cpu"),
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_filtered_persistent_topk_clamps_lengths_for_large_batch() -> None:
+    """The >32-row filtered path must stay within each row's available width."""
+    torch.set_default_device("cuda:0")
+    max_smem = getattr(
+        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        "shared_memory_per_block_optin",
+        0,
+    )
+    if max_smem < 128 * 1024:
+        pytest.skip("filtered persistent top-k requires at least 128 KiB opt-in smem")
+
+    top_k = 512
+    num_rows = 33
+    stride = 16
+    logits = torch.arange(num_rows * stride, dtype=torch.float32, device="cuda").view(
+        num_rows, stride
+    )
+    lengths = torch.tensor(
+        [-1, stride + 5, 4, *([stride + 1] * (num_rows - 3))],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "persistent_topk", logits, lengths, indices, top_k, max_seq_len=stride
+    )
+    torch.accelerator.synchronize()
+
+    expected_lengths = [0, stride, 4, *([stride] * (num_rows - 3))]
+    for row, valid_length in enumerate(expected_lengths):
+        assert set(indices[row, :valid_length].cpu().tolist()) == set(
+            range(valid_length)
+        )
+        assert torch.equal(
+            indices[row, valid_length:].cpu(),
+            torch.full((top_k - valid_length,), -1, dtype=torch.int32, device="cpu"),
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_max_seq_len_avoids_radix_deadlock() -> None:
+    """An underreported max length must not send only one CTA into radix."""
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    stride = 65536
+    bounded_length = 32768
+    num_rows = 2
+    logits = torch.arange(stride, dtype=torch.float32, device="cuda").repeat(
+        num_rows, 1
+    )
+    lengths = torch.full((num_rows,), stride, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "persistent_topk",
+        logits,
+        lengths,
+        indices,
+        top_k,
+        max_seq_len=bounded_length,
+    )
+    torch.accelerator.synchronize()
+
+    expected = set(range(bounded_length - top_k, bounded_length))
+    for row in range(num_rows):
+        assert set(indices[row].cpu().tolist()) == expected
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
@@ -896,7 +1008,7 @@ def test_persistent_topk_clamps_negative_and_over_width_lengths() -> None:
         )
         assert torch.equal(
             indices[row, valid_length:].cpu(),
-            torch.full((top_k - valid_length,), -1, dtype=torch.int32),
+            torch.full((top_k - valid_length,), -1, dtype=torch.int32, device="cpu"),
         )
 
 

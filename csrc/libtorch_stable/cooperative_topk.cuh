@@ -496,10 +496,12 @@ __device__ void large_topk(const float* __restrict__ row_input,
 template <uint32_t TopK, uint32_t CS>
 __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   const auto rank = blockIdx.y, row = blockIdx.x, tx = threadIdx.x;
-  // Clamp at 0: `sl` is compared signed here but cast to uint32 below, so a
-  // negative length would otherwise emit indices 0..TopK-1 as valid instead
-  // of the -1 padding.
-  const int32_t sl = params.lengths[row] > 0 ? params.lengths[row] : 0;
+  // Clamp signed lengths to the row width before the uint32 paths below.
+  // Negative lengths would otherwise emit indices 0..TopK-1 as valid instead
+  // of the -1 padding, while over-width lengths could select past the row.
+  const uint32_t non_negative_sl =
+      params.lengths[row] > 0 ? static_cast<uint32_t>(params.lengths[row]) : 0u;
+  const uint32_t sl = min(non_negative_sl, params.stride);
   int32_t* out = params.output + row * TopK;
   const float* in = params.input + row * params.stride;
 
