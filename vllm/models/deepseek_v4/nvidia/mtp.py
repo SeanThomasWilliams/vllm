@@ -340,6 +340,10 @@ class DeepSeekV4MTP(nn.Module):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # BaseModelLoader invokes the model hook after this method. Reset the
+        # per-cycle guard here so direct/InstantTensor-style callers also get
+        # one finalization for every new weight load.
+        self._post_load_finalization_done = False
         # Weight name remapping for checkpoint compatibility.
         # Maps checkpoint weight paths to model parameter paths.
         WEIGHT_NAME_REMAPPING: dict[str, str] = {
@@ -535,7 +539,10 @@ class DeepSeekV4MTP(nn.Module):
             layer.mtp_block.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        if getattr(self, "_post_load_finalization_done", False):
+            return
         self.finalize_mega_moe_weights()
+        self._post_load_finalization_done = True
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """

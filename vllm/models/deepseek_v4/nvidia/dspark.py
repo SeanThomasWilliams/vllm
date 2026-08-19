@@ -456,6 +456,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
+        # BaseModelLoader invokes the model hook after this method. Reset the
+        # per-cycle guard here so direct/InstantTensor-style callers also get
+        # one finalization for every new weight load.
+        self._post_load_finalization_done = False
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
         if use_mega_moe:
@@ -580,8 +584,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        if getattr(self, "_post_load_finalization_done", False):
+            return
         self._finalize_moe()
         self.model.finalize_mhc_weights()
+        self._post_load_finalization_done = True
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

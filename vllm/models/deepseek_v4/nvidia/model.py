@@ -2074,15 +2074,22 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # BaseModelLoader invokes the model hook after this method. Reset the
+        # per-cycle guard here so direct/InstantTensor-style callers also get
+        # one finalization for every new weight load.
+        self._post_load_finalization_done = False
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        if getattr(self, "_post_load_finalization_done", False):
+            return
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         self.model.setup_b12x_wo_projection()
+        self._post_load_finalization_done = True
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
