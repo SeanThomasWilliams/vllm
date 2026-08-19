@@ -187,16 +187,14 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return []
 
         accepted_tokens = []
+        probe = self.matcher.fork()
         for token in tokens:
-            if self.matcher.accept_token(token):
+            if probe.accept_token(token):
                 accepted_tokens.append(token)
-                if self.matcher.is_terminated():
+                if probe.is_terminated():
                     break
             else:
                 break
-        if len(accepted_tokens) > 0:
-            # Rollback the FSM to the initial state
-            self.matcher.rollback(len(accepted_tokens))
         return accepted_tokens
 
     def rollback(self, num_tokens: int) -> None:

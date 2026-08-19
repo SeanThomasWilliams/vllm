@@ -289,7 +289,7 @@ def test_xgrammar_accept_tokens_stops_at_termination(capfd):
 
 
 def test_xgrammar_validate_tokens_stops_at_termination(capfd):
-    """Validation rolls back after reaching a terminating EOS."""
+    """Validation probes a fork and stops at a terminating EOS."""
     tokenizer, _, request, prompt = _make_manager_and_request("xgrammar")
     grammar = request.structured_output_request.grammar
 
@@ -298,10 +298,12 @@ def test_xgrammar_validate_tokens_stops_at_termination(capfd):
     eos = tokenizer.eos_token_id
     trailing = tokenizer.encode("\n")[0]
 
+    processed_before = grammar.num_processed_tokens
     assert grammar.validate_tokens([eos, trailing]) == [eos]
     assert "trying to accept new token" not in capfd.readouterr().err
-    # Check matcher state directly to verify validation rolled it back.
+    # The probe matcher advances; the live matcher and counter do not.
     assert not grammar.matcher.is_terminated()
+    assert grammar.num_processed_tokens == processed_before
 
     assert grammar.accept_tokens(request.request_id, [eos])
     assert grammar.is_terminated()
