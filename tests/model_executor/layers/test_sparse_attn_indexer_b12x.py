@@ -9,6 +9,58 @@ import pytest
 import torch
 
 from vllm.model_executor.layers import sparse_attn_indexer as indexer_mod
+from vllm.platforms import current_platform
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    _prepare_uniform_decode_kernel,
+)
+
+
+def test_native_decode_lengths_clamp_padded_requests():
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.decode_seq_lens_buffer = torch.empty(4, dtype=torch.int32)
+    builder.offsets_buffer = torch.arange(2, dtype=torch.int32)
+
+    seq_lens, _, _, _, requires_padding = builder._prepare_decode_tensors(
+        seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        decode_lens=torch.tensor([2, 2], dtype=torch.int32),
+        decode_lens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        num_decodes=2,
+        num_decode_tokens=4,
+        use_native=True,
+        next_n=2,
+        max_decode_len=2,
+    )
+
+    assert seq_lens.tolist() == [[0, 0], [2, 3]]
+    assert not requires_padding
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_uniform_decode_lengths_clamp_padded_requests():
+    device = torch.device("cuda")
+    seq_lens = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    decode_seq_lens = torch.empty(4, dtype=torch.int32, device=device)
+    block_table = torch.zeros((2, 1), dtype=torch.int32, device=device)
+    expanded_block_table = torch.empty((4, 1), dtype=torch.int32, device=device)
+    decode_lens = torch.empty(4, dtype=torch.int32, device=device)
+
+    _prepare_uniform_decode_kernel[(4,)](
+        seq_lens,
+        decode_seq_lens,
+        block_table,
+        block_table.stride(0),
+        expanded_block_table,
+        expanded_block_table.stride(0),
+        decode_lens,
+        2,
+        BLOCK_SIZE=1024,
+    )
+    torch.accelerator.synchronize()
+
+    assert decode_seq_lens.cpu().tolist() == [0, 0, 2, 3]
 
 
 def test_query_split_context_crossover_env(monkeypatch):
