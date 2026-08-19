@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     _parse_tier_filter,
 )
 from vllm.v1.kv_offload.base import (
+    LoadStoreSpec,
     Locality,
     LookupResult,
     Medium,
@@ -44,6 +45,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TieringOffloadingMetrics,
     TransferJob,
+    WorkerTransferSpec,
 )
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
@@ -180,6 +182,37 @@ def test_tiering_spec_collects_secondary_metric_definitions(monkeypatch):
         assert metrics[metric_name].labelnames == ("tier",)
 
 
+def test_retain_primary_cache_false_releases_completed_store():
+    """A durable secondary store turns the CPU primary into a working set."""
+    mock_region = _mock_mmap_region(2)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=2, mmap_region=mock_region
+    )
+    secondary_tier = ExampleSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="example",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary_tier,
+        secondary_tiers=[secondary_tier],
+        retain_primary_cache=False,
+    )
+    keys = to_keys([1])
+    try:
+        manager.on_new_request(_CTX)
+        assert manager.prepare_store(keys, _CTX) is not None
+        manager.complete_store(keys, _CTX)
+        assert primary_tier.lookup(keys[0], _CTX) is LookupResult.HIT
+
+        context = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        manager.on_schedule_end(context)
+        manager.on_schedule_end(context)
+        assert primary_tier.lookup(keys[0], _CTX) is LookupResult.MISS
+    finally:
+        manager.shutdown()
+
+
 def test_tiering_manager_aggregates_secondary_stats():
     mock_region = _mock_mmap_region(5)
     primary_tier = CPUPrimaryTierOffloadingManager(
@@ -216,6 +249,108 @@ def test_tiering_manager_aggregates_secondary_stats():
     second_stats = manager.get_stats()
     assert second_stats is not None
     assert MetricsSecondaryTierManager.MY_TIER_METRIC not in second_stats.data["data"]
+
+
+class WorkerControlSecondaryTierManager(MetricsSecondaryTierManager):
+    """Worker-transfer tier exposing the filesystem control lifecycle."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.control_actions: list[str] = []
+        self.completed_worker_stores: list[bool] = []
+
+    def uses_worker_transfers(self) -> bool:
+        return True
+
+    def build_worker_store_transfer(self, job_metadata: TransferJob):
+        return LoadStoreSpec(), LoadStoreSpec()
+
+    def _control(self, job_metadata: TransferJob, action: str):
+        self.control_actions.append(action)
+        spec = LoadStoreSpec()
+        return WorkerTransferSpec(
+            req_id=job_metadata.req_context.req_id,
+            src_spec=spec,
+            dst_spec=spec,
+            operation=action,
+        )
+
+    def begin_worker_transfer_completion(self, job_metadata, success):
+        return self._control(job_metadata, "commit" if success else "abort")
+
+    def begin_worker_transfer_release(self, job_metadata):
+        return self._control(job_metadata, "release")
+
+    def begin_worker_transfer_finalize(self, job_metadata):
+        return self._control(job_metadata, "finalize")
+
+    def complete_worker_store(self, job_metadata, success):
+        self.completed_worker_stores.append(success)
+
+
+def test_worker_store_commit_release_finalize_and_abort():
+    """Worker stores use a durable success chain and an abort fallback."""
+    mock_region = _mock_mmap_region(4)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=4, mmap_region=mock_region
+    )
+    secondary_tier = WorkerControlSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="worker",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary_tier, secondary_tiers=[secondary_tier]
+    )
+    try:
+        manager.on_new_request(_CTX)
+        first_key = to_keys([1])
+        assert manager.prepare_store(first_key, _CTX) is not None
+        manager.complete_store(first_key, _CTX)
+        jobs = manager.pop_worker_transfer_jobs(lambda: 10)
+        assert list(jobs) == [10]
+
+        control = manager.complete_worker_transfer(10, success=True)
+        assert control is not None and control.operation == "commit"
+        control = manager.complete_worker_control(10, success=True)
+        assert control is not None and control.operation == "release"
+        control = manager.complete_worker_control(10, success=True)
+        assert control is not None and control.operation == "finalize"
+        assert manager.complete_worker_control(10, success=True) is None
+        assert secondary_tier.control_actions == ["commit", "release", "finalize"]
+        assert secondary_tier.completed_worker_stores == [True]
+
+        second_key = to_keys([2])
+        assert manager.prepare_store(second_key, _CTX) is not None
+        manager.complete_store(second_key, _CTX)
+        jobs = manager.pop_worker_transfer_jobs(lambda: 11)
+        assert list(jobs) == [11]
+        control = manager.complete_worker_transfer(11, success=False)
+        assert control is not None and control.operation == "abort"
+        assert manager.complete_worker_control(11, success=True) is None
+        assert secondary_tier.control_actions[-1] == "abort"
+        assert secondary_tier.completed_worker_stores[-1] is False
+
+        third_key = to_keys([3])
+        assert manager.prepare_store(third_key, _CTX) is not None
+        manager.complete_store(third_key, _CTX)
+        jobs = manager.pop_worker_transfer_jobs(lambda: 12)
+        assert list(jobs) == [12]
+        control = manager.complete_worker_transfer(12, success=True)
+        assert control is not None and control.operation == "commit"
+        control = manager.complete_worker_control(12, success=True)
+        assert control is not None and control.operation == "release"
+        control = manager.complete_worker_control(12, success=False)
+        assert control is not None and control.operation == "abort"
+        assert manager.complete_worker_control(12, success=True) is None
+        assert secondary_tier.control_actions[-3:] == [
+            "commit",
+            "release",
+            "abort",
+        ]
+        assert secondary_tier.completed_worker_stores[-1] is False
+    finally:
+        manager.shutdown()
 
 
 class TestExampleSecondaryTierManager:

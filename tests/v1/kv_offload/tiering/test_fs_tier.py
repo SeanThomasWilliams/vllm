@@ -35,12 +35,17 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-from vllm.v1.kv_offload.tiering.fs.manager import (
-    FileSystemTierManager,
+from vllm.v1.kv_offload.tiering.fs.common import (
+    FileSystemControlSpec,
+    FileSystemLoadStoreSpec,
+    FileSystemLookupSpec,
 )
+from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.fs.worker import FileSystemWorkerTransferHandler
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -991,8 +996,65 @@ def test_cascade_store_emits_fs_event_through_tiering_manager(tmp_path):
         tier.shutdown()
 
 
+def test_worker_lookup_batches_all_pending_keys(tmp_path):
+    """A scheduler step emits one worker lookup for all pending keys."""
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(tp_size=2, world_size=2),
+        primary_kv_view=memoryview(
+            _page_aligned_zero_tensor(2, _BLOCK_ELEMENTS).numpy()
+        ),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    try:
+        keys = [key(1), key(2), key(3)]
+        assert all(
+            tier.lookup(block_key, _CTX) is LookupResult.RETRY for block_key in keys
+        )
+        jobs = tier.pop_worker_lookup_jobs(lambda: 17)
+        assert list(jobs) == [17]
+        spec = jobs[17].src_spec
+        assert isinstance(spec, FileSystemLookupSpec)
+        assert len(spec.file_paths) == 2 * len(keys)
+        assert tier._worker_lookup_job_keys[17] == keys
+
+        tier.complete_worker_lookup(17, success=False)
+        assert [tier.lookup(block_key, _CTX) for block_key in keys] == [
+            LookupResult.MISS
+        ] * len(keys)
+    finally:
+        tier.shutdown()
+
+
+def test_worker_transfer_manager_does_not_probe_filesystem_on_scheduler(
+    tmp_path, monkeypatch
+):
+    """World-size worker transfers keep config and I/O on the workers."""
+    import vllm.v1.kv_offload.tiering.fs.manager as manager_module
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("scheduler performed filesystem I/O")
+
+    monkeypatch.setattr(manager_module, "ensure_config_file", fail_if_called)
+    monkeypatch.setattr(manager_module, "probe_o_direct", fail_if_called)
+    tensor = _page_aligned_zero_tensor(1, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(tp_size=2, world_size=2),
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+    )
+    try:
+        assert tier.uses_worker_transfers()
+        assert tier._use_o_direct is False
+    finally:
+        tier.shutdown()
+
+
 def test_fs_tier_cross_tp_round_trip(tmp_path):
-    """TP=2 replicated writer and TP=4 reader share namespace and bytes."""
+    """Replicated worker transfers share files across different TP sizes."""
     root = str(tmp_path)
     writer_tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
     expected = writer_tensor[0].clone()
@@ -1007,8 +1069,31 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         n_write_threads=2,
     )
     try:
-        writer.submit_store(make_job(1, [key(7)], [0]))
-        assert all(r.success for r in drain(writer))
+        job = make_job(1, [key(7)], [0])
+        src_spec, dst_spec = writer.build_worker_store_transfer(job)
+        assert isinstance(src_spec, CPULoadStoreSpec)
+        assert isinstance(dst_spec, FileSystemLoadStoreSpec)
+        writer_handler = FileSystemWorkerTransferHandler(
+            [writer_tensor], rank=0, n_read_threads=1, n_write_threads=1
+        )
+        try:
+            writer_handler.submit_store(job.job_id, src_spec, dst_spec)
+            writer_handler.wait()
+            assert writer_handler.get_finished()[0].success
+            control_spec = FileSystemControlSpec(
+                action="commit",
+                file_paths=dst_spec.file_paths,
+                temp_file_paths=dst_spec.temp_file_paths or [],
+                block_size=dst_spec.block_size,
+                num_ranks=dst_spec.num_ranks,
+                config_path=dst_spec.config_path,
+                run_config=dst_spec.run_config,
+            )
+            writer_handler.submit_control(job.job_id, control_spec)
+            writer_handler.wait()
+            assert writer_handler.get_finished()[0].success
+        finally:
+            writer_handler.shutdown()
         writer_base = writer.file_mapper.base_path
         writer_path = writer.file_mapper.get_file_name(key(7))
     finally:
@@ -1028,9 +1113,19 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
     try:
         assert reader.file_mapper.base_path == writer_base
         assert reader.file_mapper.get_file_name(key(7)) == writer_path
-        assert lookup_and_wait(reader, [key(7)]) == [LookupResult.HIT]
-        reader.submit_load(make_job(2, [key(7)], [1], is_promotion=True))
-        assert all(r.success for r in drain(reader))
+        job = make_job(2, [key(7)], [1], is_promotion=True)
+        src_spec, dst_spec = reader.build_worker_load_transfer(job)
+        assert isinstance(src_spec, FileSystemLoadStoreSpec)
+        assert isinstance(dst_spec, CPULoadStoreSpec)
+        reader_handler = FileSystemWorkerTransferHandler(
+            [reader_tensor], rank=0, n_read_threads=1, n_write_threads=1
+        )
+        try:
+            reader_handler.submit_load(job.job_id, src_spec, dst_spec)
+            reader_handler.wait()
+            assert reader_handler.get_finished()[0].success
+        finally:
+            reader_handler.shutdown()
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()

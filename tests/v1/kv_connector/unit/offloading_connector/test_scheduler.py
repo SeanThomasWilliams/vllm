@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    TransferJobStatus,
     get_sliding_window_size_in_chunks,
     is_store_reachable_swa_chunk,
 )
@@ -1845,6 +1846,51 @@ def test_complete_store_waits_for_all_worker_acks(
     )
     assert runner.manager.complete_store.call_count == 1
     assert job_id not in runner.connector_scheduler._jobs
+
+
+def test_worker_transfer_failure_is_aggregated_across_all_ranks():
+    """A single failed rank makes the worker transfer fail at the barrier."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._jobs = {
+        42: TransferJobStatus(
+            req_id="req",
+            pending_count=3,
+            keys=set(),
+            is_store=False,
+            is_worker_transfer=True,
+            worker_operation="transfer",
+        )
+    }
+    scheduler._stale_job_threshold = 0
+    scheduler._connector_stats = OffloadingConnectorStats()
+    scheduler.manager = MagicMock()
+    scheduler.manager.complete_worker_transfer.return_value = None
+    scheduler.config = SimpleNamespace(num_workers=3)
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={42: 1}, failed_jobs={42: 1}
+            )
+        )
+    )
+    assert scheduler._jobs[42].pending_count == 2
+    scheduler.manager.complete_worker_transfer.assert_not_called()
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={42: 1})
+        )
+    )
+    assert scheduler._jobs[42].pending_count == 1
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={42: 1})
+        )
+    )
+    scheduler.manager.complete_worker_transfer.assert_called_once_with(42, False)
+    assert 42 not in scheduler._jobs
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

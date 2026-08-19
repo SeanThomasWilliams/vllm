@@ -235,7 +235,9 @@ def test_register_kv_caches_shared_layers_with_different_offsets():
             KVCacheTensor(size=2 * page_size * NUM_BLOCKS, shared_by=[layer_a, layer_b])
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[layer_a, layer_b], kv_cache_spec=kv_cache_spec)
+            KVCacheGroupSpec(
+                layer_names=[layer_a, layer_b], kv_cache_spec=kv_cache_spec
+            )
         ],
     )
     worker, spec = _make_worker(kv_cache_config)
@@ -245,11 +247,10 @@ def test_register_kv_caches_shared_layers_with_different_offsets():
     assert len(canonical.tensors) == 2
     assert canonical.tensors[0].tensor.storage_offset() == 0
     assert canonical.tensors[1].tensor.storage_offset() == NUM_BLOCKS * page_size
-    assert canonical.group_data_refs == [
-        [
-            CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size),
-            CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=page_size),
-        ]
+    refs = canonical.group_data_refs[0]
+    assert [(ref.tensor_idx, ref.page_size_bytes) for ref in refs] == [
+        (0, page_size),
+        (1, page_size),
     ]
 
 
@@ -289,9 +290,7 @@ def test_packed_cache_with_offset_roundtrips_entire_block_bytes(tmp_path):
             )
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=[layer_name], kv_cache_spec=kv_cache_spec
-            )
+            KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=kv_cache_spec)
         ],
     )
 
@@ -315,7 +314,9 @@ def test_packed_cache_with_offset_roundtrips_entire_block_bytes(tmp_path):
         )
         assert store_handler.submit_store(1, CPULoadStoreSpec([0]), store_spec)
         store_handler.wait()
-        assert store_handler.get_finished()[0].success
+        store_result = store_handler.get_finished()[0]
+        assert store_result.success
+        assert store_result.transfer_time is not None
         assert store_handler.submit_control(
             1,
             FileSystemControlSpec(
@@ -327,6 +328,48 @@ def test_packed_cache_with_offset_roundtrips_entire_block_bytes(tmp_path):
         )
         store_handler.wait()
         assert store_handler.get_finished()[0].success
+        assert final_path.exists()
+
+        for action in ("release", "finalize"):
+            assert store_handler.submit_control(
+                1,
+                FileSystemControlSpec(
+                    action=action,
+                    file_paths=store_spec.file_paths,
+                    temp_file_paths=store_spec.temp_file_paths or [],
+                    block_size=store_spec.block_size,
+                ),
+            )
+            store_handler.wait()
+            result = store_handler.get_finished()[0]
+            assert result.success
+            assert result.transfer_time is not None
+            assert final_path.exists()
+
+        abort_final_path = tmp_path / "abort.bin"
+        abort_temp_path = tmp_path / "abort.tmp"
+        abort_spec = FileSystemLoadStoreSpec(
+            file_paths=[str(abort_final_path)],
+            temp_file_paths=[str(abort_temp_path)],
+            block_size=block_stride,
+        )
+        assert store_handler.submit_store(3, CPULoadStoreSpec([1]), abort_spec)
+        store_handler.wait()
+        assert store_handler.get_finished()[0].success
+        abort_control = FileSystemControlSpec(
+            action="commit",
+            file_paths=abort_spec.file_paths,
+            temp_file_paths=abort_spec.temp_file_paths or [],
+            block_size=abort_spec.block_size,
+        )
+        assert store_handler.submit_control(3, abort_control)
+        store_handler.wait()
+        assert store_handler.get_finished()[0].success
+        abort_control.action = "abort"
+        assert store_handler.submit_control(3, abort_control)
+        store_handler.wait()
+        assert store_handler.get_finished()[0].success
+        assert not abort_final_path.exists()
     finally:
         store_handler.shutdown()
 
@@ -343,26 +386,18 @@ def test_packed_cache_with_offset_roundtrips_entire_block_bytes(tmp_path):
             CPULoadStoreSpec([0]),
         )
         load_handler.wait()
-        assert load_handler.get_finished()[0].success
+        load_result = load_handler.get_finished()[0]
+        assert load_result.success
+        assert load_result.transfer_time is not None
         assert torch.equal(restored[0], expected)
     finally:
         load_handler.shutdown()
 
 
 def test_worker_transfer_submit_failure_reports_failed_metadata():
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
-        OffloadingConnectorWorker,
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
     )
-
-    spec = MagicMock(spec=OffloadingSpec)
-    worker = OffloadingConnectorWorker(
-        spec=spec,
-        vllm_config=_single_rank_vllm_config(NUM_KV_HEADS),
-        kv_cache_config=KVCacheConfig(
-            num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[]
-        ),
-    )
-    worker.worker = MagicMock()
     worker.worker.submit_transfer.return_value = False
     src_spec = MagicMock()
     dst_spec = MagicMock()
@@ -389,14 +424,9 @@ def test_worker_transfer_submit_exception_reports_failed_metadata(monkeypatch):
     logger = MagicMock()
     monkeypatch.setattr(worker_module, "logger", logger)
 
-    spec = MagicMock(spec=OffloadingSpec)
-    worker = worker_module.OffloadingConnectorWorker(
-        spec=spec,
-        kv_cache_config=KVCacheConfig(
-            num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[]
-        ),
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
     )
-    worker.worker = MagicMock()
     worker.worker.submit_transfer.side_effect = [RuntimeError("submit failed"), False]
 
     src_spec = MagicMock()
