@@ -840,16 +840,19 @@ class EngineCore:
         self,
         reset_running_requests: bool = True,
         reset_connector: bool = True,
-    ) -> None:
+    ) -> bool:
         # reset_connector=True so external connectors clear alongside
         # local caches, matching the pause_generation(clear_cache=True)
         # contract. No-op when no connector is configured.
-        self.reset_prefix_cache(
+        reset_ok = self.reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
         )
+        if not reset_ok:
+            return False
         self.reset_mm_cache()
         self.reset_encoder_cache()
+        return True
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -877,8 +880,11 @@ class EngineCore:
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
-        if clear_cache:
-            self._reset_caches()
+        if clear_cache and not self._reset_caches():
+            raise RuntimeError(
+                "Cannot complete pause while the KV connector reset barrier "
+                "is still pending"
+            )
 
         return None
 
@@ -1878,8 +1884,11 @@ class EngineCoreProc(EngineCore):
             raise ValueError(f"Invalid pause mode: {mode}")
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
-            if clear_cache:
-                engine._reset_caches()
+            if clear_cache and not engine._reset_caches():
+                engine._idle_state_callbacks.append(
+                    partial(engine_idle_callback, future=future)
+                )
+                return
             future.set_result(None)
 
         if mode == "abort":
@@ -1892,8 +1901,12 @@ class EngineCoreProc(EngineCore):
         self.scheduler.set_pause_state(pause_state)
 
         if self._pause_complete():
-            if clear_cache:
-                self._reset_caches()
+            if clear_cache and not self._reset_caches():
+                future = Future[Any]()
+                self._idle_state_callbacks.append(
+                    partial(engine_idle_callback, future=future)
+                )
+                return future
             return None
 
         future = Future[Any]()
