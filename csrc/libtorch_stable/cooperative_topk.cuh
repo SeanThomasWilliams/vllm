@@ -46,7 +46,7 @@ struct CooperativeTopKParams {
   const int32_t* __restrict__ lengths;
   hist4096::Tie* __restrict__ tie_ws;  // per-row tie workspace, see
                                        // kTieWsPerRow
-  uint32_t num_rows, stride;
+  uint32_t num_rows, stride, max_seq_len;
 };
 
 // ============================================================================
@@ -501,9 +501,10 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   // of the -1 padding, while over-width lengths could select past the row.
   const uint32_t non_negative_sl =
       params.lengths[row] > 0 ? static_cast<uint32_t>(params.lengths[row]) : 0u;
-  const uint32_t sl = min(non_negative_sl, params.stride);
-  int32_t* out = params.output + row * TopK;
-  const float* in = params.input + row * params.stride;
+  const uint32_t physical_bound = min(params.stride, params.max_seq_len);
+  const uint32_t sl = min(non_negative_sl, physical_bound);
+  int32_t* out = params.output + static_cast<size_t>(row) * TopK;
+  const float* in = params.input + static_cast<size_t>(row) * params.stride;
 
   // Trivial: seq_len <= TopK
   if (sl <= static_cast<int32_t>(TopK)) {
@@ -545,7 +546,8 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   extern __shared__ uint8_t sr[];
 
   constexpr uint32_t kTieWsPerRow = kTieCapPerRank<TopK>;
-  hist4096::Tie* row_tie_ws = params.tie_ws + row * kTieWsPerRow;
+  hist4096::Tie* row_tie_ws =
+      params.tie_ws + static_cast<size_t>(row) * kTieWsPerRow;
 
   if (use_singlepass) {
     auto* smem = reinterpret_cast<FusedSmem*>(sr);

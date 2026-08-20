@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <limits>
 
 #include "torch_utils.h"
 
@@ -40,7 +41,8 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
             logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
             lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-            static_cast<uint32_t>(TopK), static_cast<uint32_t>(stride), stream);
+            static_cast<uint32_t>(TopK), static_cast<uint32_t>(stride),
+            static_cast<uint32_t>(max_seq_len), stream);
     STD_TORCH_CHECK(status == cudaSuccess,
                     "FilteredTopK failed: ", cudaGetErrorString(status));
   } else {
@@ -149,7 +151,8 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
               output.mutable_data_ptr<int32_t>(),
               lengths.const_data_ptr<int32_t>(),
               static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
-              static_cast<uint32_t>(stride), stream);
+              static_cast<uint32_t>(stride), static_cast<uint32_t>(max_seq_len),
+              stream);
       STD_TORCH_CHECK(status == cudaSuccess, "FilteredTopK fallback failed: ",
                       cudaGetErrorString(status));
       return;
@@ -254,6 +257,14 @@ void persistent_topk(const torch::stable::Tensor& logits,
   STD_TORCH_CHECK(output.dim() == 2, "output must be 2D");
 
   const int64_t num_rows = logits.size(0);
+  const int64_t stride = logits.stride(0);
+  STD_TORCH_CHECK(stride >= 0 && stride <= std::numeric_limits<int32_t>::max(),
+                  "persistent_topk: row stride must be in [0, INT32_MAX], got ",
+                  stride);
+  STD_TORCH_CHECK(
+      max_seq_len >= 0 && max_seq_len <= std::numeric_limits<int32_t>::max(),
+      "persistent_topk: max_seq_len must be in [0, INT32_MAX], got ",
+      max_seq_len);
 
   STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
   STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,

@@ -79,6 +79,18 @@ def _use_persistent_topk_decode(topk_tokens: int) -> bool:
     return current_platform.is_cuda() and topk_tokens in (512, 1024, 2048)
 
 
+def _use_cooperative_topk_decode(topk_tokens: int, num_rows: int, stride: int) -> bool:
+    return (
+        current_platform.is_cuda()
+        and topk_tokens in (512, 1024, 2048)
+        and num_rows <= 32
+        and stride % 4 == 0  # TMA 16-byte alignment
+        and current_platform.has_device_capability(90)
+        and not current_platform.is_device_capability_family(120)
+        and hasattr(torch.ops._C, "cooperative_topk")
+    )
+
+
 def _local_to_global_position(
     local_idx: torch.Tensor, rank: int, world_size: int, interleave: int
 ) -> torch.Tensor:
@@ -2370,13 +2382,8 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        use_cooperative_topk = (
-            current_platform.is_cuda()
-            and topk_tokens in (512, 1024, 2048)
-            and num_rows <= 32
-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
+        use_cooperative_topk = _use_cooperative_topk_decode(
+            topk_tokens, num_rows, logits.stride(0)
         )
         use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
             512,

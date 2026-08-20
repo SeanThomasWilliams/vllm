@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -38,6 +40,21 @@ COOPERATIVE_TOPK_BACKEND = pytest.param(
 )
 WORKSPACE_TOPK_BACKENDS = ["persistent_topk", COOPERATIVE_TOPK_BACKEND]
 TOPK_BACKENDS = ["top_k_per_row_decode", *WORKSPACE_TOPK_BACKENDS]
+
+
+def test_cooperative_topk_dispatch_requires_registered_op(monkeypatch) -> None:
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _use_cooperative_topk_decode,
+    )
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "has_device_capability", lambda _cc: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda _cc: False
+    )
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert not _use_cooperative_topk_decode(512, 1, 2048)
 
 
 def _run_topk_backend(
@@ -912,6 +929,60 @@ def test_cooperative_topk_over_width_length_is_padded() -> None:
     )
 
 
+@pytest.mark.skipif(
+    not _is_cooperative_topk_available(),
+    reason="cooperative_topk production predicate or op is unavailable",
+)
+@torch.inference_mode()
+def test_cooperative_topk_clamps_underreported_max_seq_len() -> None:
+    """The logical max length must bound selection below the physical stride."""
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    stride = 2048
+    logical_max_len = 1024
+    num_rows = 2
+    logits = torch.arange(stride, dtype=torch.float32, device="cuda").repeat(
+        num_rows, 1
+    )
+    lengths = torch.full((num_rows,), stride, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "cooperative_topk",
+        logits,
+        lengths,
+        indices,
+        top_k,
+        max_seq_len=logical_max_len,
+    )
+    torch.accelerator.synchronize()
+
+    expected = set(range(logical_max_len - top_k, logical_max_len))
+    for row in range(num_rows):
+        assert set(indices[row].cpu().tolist()) == expected
+
+
+@pytest.mark.skipif(
+    not _is_cooperative_topk_available(),
+    reason="cooperative_topk production predicate or op is unavailable",
+)
+@torch.inference_mode()
+def test_cooperative_topk_rejects_out_of_range_scalar_max_seq_len() -> None:
+    """Reject invalid scalar bounds before any cooperative-kernel narrowing."""
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    logits = torch.zeros((1, 16), dtype=torch.float32, device="cuda")
+    lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+
+    for max_seq_len in (-1, 2**31):
+        with pytest.raises(RuntimeError, match="max_seq_len"):
+            torch.ops._C.cooperative_topk(
+                logits, lengths, indices, workspace, top_k, max_seq_len
+            )
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @torch.inference_mode()
 def test_filtered_persistent_topk_clamps_lengths_for_large_batch() -> None:
@@ -956,6 +1027,44 @@ def test_filtered_persistent_topk_clamps_lengths_for_large_batch() -> None:
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @torch.inference_mode()
+def test_filtered_persistent_topk_clamps_underreported_max_seq_len() -> None:
+    """Filtered top-k must use physical rows with a smaller logical bound."""
+    torch.set_default_device("cuda:0")
+    max_smem = getattr(
+        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        "shared_memory_per_block_optin",
+        0,
+    )
+    if max_smem < 128 * 1024:
+        pytest.skip("filtered persistent top-k requires at least 128 KiB opt-in smem")
+
+    top_k = 512
+    num_rows = 33
+    stride = 2048
+    logical_max_len = 1024
+    logits = torch.arange(stride, dtype=torch.float32, device="cuda").repeat(
+        num_rows, 1
+    )
+    lengths = torch.full((num_rows,), stride, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    _run_topk_backend(
+        "persistent_topk",
+        logits,
+        lengths,
+        indices,
+        top_k,
+        max_seq_len=logical_max_len,
+    )
+    torch.accelerator.synchronize()
+
+    expected = set(range(logical_max_len - top_k, logical_max_len))
+    for row in range(num_rows):
+        assert set(indices[row].cpu().tolist()) == expected
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
 def test_persistent_topk_max_seq_len_avoids_radix_deadlock() -> None:
     """An underreported max length must not send only one CTA into radix."""
     torch.set_default_device("cuda:0")
@@ -982,6 +1091,24 @@ def test_persistent_topk_max_seq_len_avoids_radix_deadlock() -> None:
     expected = set(range(bounded_length - top_k, bounded_length))
     for row in range(num_rows):
         assert set(indices[row].cpu().tolist()) == expected
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_rejects_out_of_range_scalar_max_seq_len() -> None:
+    """Reject invalid scalar bounds before any kernel-side narrowing."""
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    logits = torch.zeros((1, 16), dtype=torch.float32, device="cuda")
+    lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+
+    for max_seq_len in (-1, 2**31):
+        with pytest.raises(RuntimeError, match="max_seq_len"):
+            torch.ops._C.persistent_topk(
+                logits, lengths, indices, workspace, top_k, max_seq_len
+            )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

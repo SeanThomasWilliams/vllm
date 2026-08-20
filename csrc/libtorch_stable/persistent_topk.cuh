@@ -925,8 +925,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
     const uint32_t seq_len =
         non_negative_len < row_bound ? non_negative_len : row_bound;
-    int32_t* row_output = params.output + row_idx * params.top_k;
-    const float* row_input = params.input + row_idx * params.stride;
+    int32_t* row_output =
+        params.output + static_cast<size_t>(row_idx) * params.top_k;
+    const float* row_input =
+        params.input + static_cast<size_t>(row_idx) * params.stride;
 
     if (seq_len <= RADIX_THRESHOLD) {
       if (cta_in_group == 0) {
@@ -1042,7 +1044,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                               IdType* __restrict__ output,
                               const IdType* __restrict__ lengths,
                               uint32_t num_rows, uint32_t top_k,
-                              uint32_t max_len) {
+                              uint32_t max_len, uint32_t logical_max_len) {
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
@@ -1055,10 +1057,11 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   const uint32_t raw_length =
       (lengths != nullptr)
           ? (lengths[bid] > 0 ? static_cast<uint32_t>(lengths[bid]) : 0u)
-          : max_len;
-  const int length = static_cast<int>(min(raw_length, max_len));
-  const DType* score = input + bid * max_len;
-  IdType* dst = output + bid * top_k;
+          : logical_max_len;
+  const uint32_t length_u32 = min(min(raw_length, max_len), logical_max_len);
+  const int length = static_cast<int>(length_u32);
+  const DType* score = input + static_cast<size_t>(bid) * max_len;
+  IdType* dst = output + static_cast<size_t>(bid) * top_k;
 
   // Trivial case: length <= top_k
   if (length <= static_cast<int>(top_k)) {
@@ -1308,19 +1311,17 @@ constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
 }
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(const DType* input,
-                                        IdType* output_indices,
-                                        const IdType* lengths,
-                                        uint32_t num_rows, uint32_t top_k_val,
-                                        uint32_t max_len,
-                                        cudaStream_t stream = 0) {
+cudaError_t FilteredTopKRaggedTransform(
+    const DType* input, IdType* output_indices, const IdType* lengths,
+    uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+    uint32_t logical_max_len, cudaStream_t stream = 0) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
 
   dim3 grid(num_rows);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input,    &output_indices, &lengths,
-                  &num_rows, &top_k_val,      &max_len};
+  void* args[] = {&input,     &output_indices, &lengths,        &num_rows,
+                  &top_k_val, &max_len,        &logical_max_len};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
@@ -1349,6 +1350,16 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
 }  // namespace filtered_topk
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
+cudaError_t FilteredTopKRaggedTransform(
+    const DType* input, IdType* output_indices, const IdType* lengths,
+    uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+    uint32_t logical_max_len, cudaStream_t stream = 0) {
+  return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
+      input, output_indices, lengths, num_rows, top_k_val, max_len,
+      logical_max_len, stream);
+}
+
+template <typename DType, typename IdType, uint32_t MAX_K = 2048>
 cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         IdType* output_indices,
                                         const IdType* lengths,
@@ -1356,7 +1367,8 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         uint32_t max_len,
                                         cudaStream_t stream = 0) {
   return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
-      input, output_indices, lengths, num_rows, top_k_val, max_len, stream);
+      input, output_indices, lengths, num_rows, top_k_val, max_len, max_len,
+      stream);
 }
 
 }  // namespace vllm

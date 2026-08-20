@@ -2,6 +2,7 @@
 // See cooperative_topk.cuh for kernel implementation.
 
 #include <cuda_runtime.h>
+#include <limits>
 
 #include "torch_utils.h"
 
@@ -53,11 +54,18 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
                                   torch::stable::Tensor& output,
                                   torch::stable::Tensor& workspace,
                                   int64_t max_seq_len) {
-  (void)max_seq_len;  // Kept for signature parity with persistent_topk.
   const int64_t num_rows = logits.size(0);
+  const int64_t stride = logits.stride(0);
+  STD_TORCH_CHECK(
+      stride >= 0 && stride <= std::numeric_limits<int32_t>::max(),
+      "cooperative_topk: row stride must be in [0, INT32_MAX], got ", stride);
+  STD_TORCH_CHECK(
+      max_seq_len >= 0 && max_seq_len <= std::numeric_limits<int32_t>::max(),
+      "cooperative_topk: max_seq_len must be in [0, INT32_MAX], got ",
+      max_seq_len);
   const cudaStream_t stream = get_current_cuda_stream();
 
-  const uint32_t stride = static_cast<uint32_t>(logits.stride(0));
+  const uint32_t stride_u32 = static_cast<uint32_t>(stride);
   // 32 = max clusters for CS=4 (32 x 4 = 128 CTAs = 66% of SMs, leaves
   // headroom)
   STD_TORCH_CHECK(
@@ -65,10 +73,10 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
       "cooperative_topk supports <=32 rows; use persistent_topk for "
       "larger batches");
 
-  STD_TORCH_CHECK(stride % 4 == 0,
+  STD_TORCH_CHECK(stride_u32 % 4 == 0,
                   "cooperative_topk: stride must be multiple of 4 for TMA "
                   "alignment, got stride (max_model_len)=",
-                  stride);
+                  stride_u32);
 
   STD_TORCH_CHECK(workspace.is_cuda(), "workspace must be CUDA tensor");
   STD_TORCH_CHECK(
@@ -80,14 +88,16 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
   params.output = output.mutable_data_ptr<int32_t>();
   params.lengths = lengths.const_data_ptr<int32_t>();
   params.num_rows = static_cast<uint32_t>(num_rows);
-  params.stride = stride;
+  params.stride = stride_u32;
+  params.max_seq_len = static_cast<uint32_t>(max_seq_len);
   params.tie_ws =
       reinterpret_cast<hist4096::Tie*>(workspace.mutable_data_ptr<uint8_t>());
 
   constexpr uint32_t kTieWsPerRow = ct::kTieCapPerRank<TopK>;
   STD_TORCH_CHECK(
       workspace.size(0) >=
-          static_cast<int64_t>(num_rows * kTieWsPerRow * sizeof(hist4096::Tie)),
+          static_cast<int64_t>(static_cast<size_t>(num_rows) * kTieWsPerRow *
+                               sizeof(hist4096::Tie)),
       "workspace too small");
 
   const bool supports_cluster16 = get_device_prop()->major >= 10;
@@ -123,6 +133,14 @@ void cooperative_topk(const torch::stable::Tensor& logits,
   STD_TORCH_CHECK(output.dim() == 2, "output must be 2D");
   const int64_t num_rows = logits.size(0);
   STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
+  const int64_t stride = logits.stride(0);
+  STD_TORCH_CHECK(
+      stride >= 0 && stride <= std::numeric_limits<int32_t>::max(),
+      "cooperative_topk: row stride must be in [0, INT32_MAX], got ", stride);
+  STD_TORCH_CHECK(
+      max_seq_len >= 0 && max_seq_len <= std::numeric_limits<int32_t>::max(),
+      "cooperative_topk: max_seq_len must be in [0, INT32_MAX], got ",
+      max_seq_len);
   STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
                   "output size mismatch");
   STD_TORCH_CHECK(
