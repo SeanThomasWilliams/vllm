@@ -244,6 +244,47 @@ class TestMissingInvokeEnd:
         assert args == {"location": "NYC"}
         assert "Done." in collect_content(results)
 
+    def test_unknown_tool_is_recoverable_invalid_tool_call(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = _GET_WEATHER_TOOLS
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        text = _tool_calls(
+            _invoke("missing_tool", ("location", "true", "NYC")),
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tool_call = result.tool_calls[0]
+        assert tool_call.function.name == "__invalid_dsml_tool_call__"
+        assert json.loads(tool_call.function.arguments) == {
+            "error": "The model attempted an unknown tool; retry the intended call.",
+            "tool_name": "missing_tool",
+        }
+
+    def test_truncated_tool_prefix_is_recoverable_invalid_tool_call(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = _GET_WEATHER_TOOLS
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+
+        result = parser.extract_tool_calls(DSML_TOOL_START, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tool_call = result.tool_calls[0]
+        assert tool_call.function.name == "__invalid_dsml_tool_call__"
+        assert json.loads(tool_call.function.arguments) == {
+            "error": (
+                "The model ended after an incomplete tool-call prefix; "
+                "retry the intended call."
+            )
+        }
+
 
 # ── Thinking mode initial state ──────────────────────────────────────
 
@@ -626,6 +667,33 @@ class TestParallelUnwrapping:
         args1 = json.loads(result.tool_calls[1].function.arguments)
         assert args1 == {"timezone": "EST"}
 
+    def test_duplicate_parallel_wrappers_use_each_call_schema(
+        self, mock_tokenizer, mock_request
+    ):
+        first_tool = _make_tool("first", {"arguments": {"type": "object"}})
+        second_tool = _make_tool("second", {"value": {"type": "string"}})
+        tools = [first_tool, second_tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        raw_arguments = '{"value": "payload"}'
+        text = _tool_calls(
+            _invoke("first", ("arguments", "false", raw_arguments)),
+            _invoke("second", ("arguments", "false", raw_arguments)),
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert [call.function.name for call in result.tool_calls] == [
+            "first",
+            "second",
+        ]
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "arguments": {"value": "payload"}
+        }
+        assert json.loads(result.tool_calls[1].function.arguments) == {
+            "value": "payload"
+        }
+
     def test_unwrap_parallel_streaming(
         self, mock_tokenizer, mock_request, weather_tool, time_tool
     ):
@@ -677,6 +745,95 @@ class TestParallelUnwrapping:
         assert args0 == {"arguments": {"unknown_key": "val"}}
         args1 = json.loads(result.tool_calls[1].function.arguments)
         assert args1 == {"timezone": "EST"}
+
+    def test_identical_parallel_invokes_preserve_opaque_arguments(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool(
+            "dispatch",
+            {
+                "city": {"type": "string"},
+                "payload": {"type": "string"},
+            },
+        )
+        tools = [tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        opaque_payload = (
+            '{"script":"printf \'<tag>\\n\'","meta":{"items":[1,{"quoted":"a\\"b"}]}}'
+        )
+        invoke = _invoke(
+            "dispatch",
+            ("city", "true", "Boston"),
+            ("payload", "true", opaque_payload),
+        )
+
+        result = parser.extract_tool_calls(_tool_calls(invoke, invoke), mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 2
+        for tool_call in result.tool_calls:
+            assert tool_call.function.name == "dispatch"
+            assert json.loads(tool_call.function.arguments) == {
+                "city": "Boston",
+                "payload": opaque_payload,
+            }
+
+    def test_identical_parallel_invokes_stream_without_merging(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool(
+            "dispatch",
+            {
+                "city": {"type": "string"},
+                "payload": {"type": "string"},
+            },
+        )
+        tools = [tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        opaque_payload = (
+            '{"script":"printf \'<tag>\\n\'","meta":{"items":[1,{"quoted":"a\\"b"}]}}'
+        )
+        invoke = _invoke(
+            "dispatch",
+            ("city", "true", "Boston"),
+            ("payload", "true", opaque_payload),
+        )
+
+        results = simulate_tool_streaming(
+            parser,
+            mock_request,
+            [DSML_TOOL_START, invoke, invoke, DSML_TOOL_END],
+        )
+        final_delta, _ = results[-1]
+        finish_delta = parser.finish_streaming()
+        extracted = parser._build_extracted_result(final_delta, finish_delta)
+
+        assert extracted.tools_called is True
+        assert len(extracted.tool_calls) == 2
+        for tool_call in extracted.tool_calls:
+            assert tool_call.function.name == "dispatch"
+            assert json.loads(tool_call.function.arguments) == {
+                "city": "Boston",
+                "payload": opaque_payload,
+            }
+
+    def test_single_invoke_remains_single(self, mock_tokenizer, mock_request):
+        tool = _make_tool("get_weather", {"city": {"type": "string"}})
+        tools = [tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+
+        result = parser.extract_tool_calls(
+            _tool_calls(_invoke("get_weather", ("city", "true", "Boston"))),
+            mock_request,
+        )
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Boston"}
 
     def test_unwrap_single_tool_still_works(self, mock_tokenizer, mock_request):
         tool = _make_tool("get_weather", {"location": {"type": "string"}})

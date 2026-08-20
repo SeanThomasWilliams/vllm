@@ -942,9 +942,13 @@ class ParserEngine(Parser):
 
     # ── Arg conversion helpers ─────────────────────────────────────────
 
-    def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+    def _convert_args_for_slot(self, idx: int, partial: bool) -> str:
         converter = self._arg_converter
-        if converter is None:
+        assert converter is not None
+        return converter(self._tool_slots[idx].args, partial)
+
+    def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+        if self._arg_converter is None:
             return raw_delta
 
         if not self._stream_arg_deltas:
@@ -956,7 +960,7 @@ class ParserEngine(Parser):
 
         slot = self._tool_slots[idx]
         try:
-            current_json = converter(slot.args, True)
+            current_json = self._convert_args_for_slot(idx, True)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (streaming): %s", slot.args[:80])
             return None
@@ -986,13 +990,12 @@ class ParserEngine(Parser):
         return None
 
     def _flush_arg_converter(self, idx: int) -> str | None:
-        converter = self._arg_converter
-        if converter is None:
+        if self._arg_converter is None:
             return None
 
         slot = self._tool_slots[idx]
         try:
-            final_json = converter(slot.args, False)
+            final_json = self._convert_args_for_slot(idx, False)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (flush): %s", slot.args[:80])
             return None
@@ -1041,10 +1044,9 @@ class ParserEngine(Parser):
             if not name and raw_body.strip():
                 name, args_json = self._extract_name_and_args(raw_body)
             elif raw_body.strip():
-                converter = self._arg_converter
-                if converter is not None:
+                if self._arg_converter is not None:
                     try:
-                        args_json = converter(raw_body, False)
+                        args_json = self._convert_args_for_slot(idx, False)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         logger.debug(
                             "arg converter failed (extract): %s", raw_body[:80]
