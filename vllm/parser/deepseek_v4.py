@@ -557,13 +557,35 @@ class DeepSeekV4Parser(ParserEngine):
             ]
         )
 
+    def _prepend_pending_legacy_marker(
+        self, delta: DeltaMessage | None
+    ) -> DeltaMessage | None:
+        pending = self._pending_legacy_tool_marker
+        if pending is None:
+            return delta
+
+        meaningful = bool(
+            delta
+            and (
+                delta.tool_calls
+                or delta.reasoning is not None
+                or (delta.content and delta.content.strip())
+            )
+        )
+        if not meaningful:
+            return delta
+
+        self._pending_legacy_tool_marker = None
+        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+
+        return self._merge_deltas(DeltaMessage(content=pending), delta)
+
     def _after_finish(self, delta: DeltaMessage | None) -> DeltaMessage | None:
         invalid_slot = self._finish_invalid_slot
         invalid_prefix = self._finish_invalid_prefix
         self._finish_invalid_slot = None
         self._finish_invalid_prefix = None
         self._pending_stray_tool_framing = None
-        self._pending_legacy_tool_marker = None
 
         if invalid_slot is not None:
             if not self._delta_has_tool_index(delta, invalid_slot):
@@ -571,9 +593,13 @@ class DeepSeekV4Parser(ParserEngine):
                     delta,
                     self._make_invalid_tool_delta(invalid_slot),
                 )
+            delta = self._prepend_pending_legacy_marker(delta)
+            self._pending_legacy_tool_marker = None
             return delta
 
         if invalid_prefix is None:
+            delta = self._prepend_pending_legacy_marker(delta)
+            self._pending_legacy_tool_marker = None
             return delta
 
         idx = len(self._tool_slots)
@@ -591,7 +617,10 @@ class DeepSeekV4Parser(ParserEngine):
             elif content.endswith(invalid_prefix):
                 content = content[: -len(invalid_prefix)]
             delta.content = content or None
-        return self._merge_deltas(delta, self._make_invalid_tool_delta(idx))
+        delta = self._merge_deltas(delta, self._make_invalid_tool_delta(idx))
+        delta = self._prepend_pending_legacy_marker(delta)
+        self._pending_legacy_tool_marker = None
+        return delta
 
     def extract_reasoning(
         self,
@@ -667,6 +696,9 @@ class DeepSeekV4Parser(ParserEngine):
             ):
                 explicit_close_order.append(event.tool_index)
         explicit_closes = set(explicit_close_order)
+        event_text = "".join(
+            event.value for event in events if event.type == EventType.TEXT_CHUNK
+        )
         delta = super()._events_to_delta(events, finished=finished)
         if self.skip_tool_parsing:
             return delta
@@ -745,32 +777,40 @@ class DeepSeekV4Parser(ParserEngine):
         if delta is not None and delta.content:
             if delta.tool_calls:
                 delta.content = _strip_parsed_tool_residue(delta.content) or None
-            if accepted_tool_call:
-                if delta.content and not delta.tool_calls:
-                    content = delta.content
-                    if content.strip() == _LEGACY_TOOL_CALLS_END:
-                        if finished:
-                            content = None
-                        else:
+            if accepted_tool_call and not delta.tool_calls:
+                content = delta.content
+                if content.strip() == _LEGACY_TOOL_CALLS_END:
+                    if finished:
+                        content = None
+                    else:
+                        if self._pending_legacy_tool_marker is None:
                             self._pending_legacy_tool_marker = content
-                            content = None
-                    elif self._pending_legacy_tool_marker is not None:
-                        if content.strip():
-                            content = self._pending_legacy_tool_marker + content
-                            self._pending_legacy_tool_marker = None
-                        elif finished:
-                            self._pending_legacy_tool_marker = None
-                            content = None
                         else:
-                            content = None
-                    delta.content = content
-                if (
-                    delta.content
-                    and (delta.tool_calls or finished)
-                ):
-                    delta.content = _strip_legacy_tool_calls_end(delta.content) or None
+                            self._pending_legacy_tool_marker += content
+                        content = None
+                delta.content = content
+            if (
+                accepted_tool_call
+                and delta.content
+                and (delta.tool_calls or finished)
+            ):
+                delta.content = _strip_legacy_tool_calls_end(delta.content) or None
             if delta.content and _DSML in delta.content:
                 delta.content = _escape_unparsed_dsml(delta.content)
+
+        if self._pending_legacy_tool_marker is not None:
+            if delta is not None and delta.content and not delta.content.strip():
+                self._pending_legacy_tool_marker += delta.content
+                delta.content = None
+            elif (
+                (delta is None or delta.content is None)
+                and event_text
+                and not event_text.strip()
+            ):
+                self._pending_legacy_tool_marker += event_text
+
+            delta = self._prepend_pending_legacy_marker(delta)
+
         if (
             delta is not None
             and delta.content is None

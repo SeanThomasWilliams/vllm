@@ -1023,6 +1023,111 @@ class TestLegacyToolFramingResidue:
         assert result is not None
         assert result.content == "ordinary"
 
+    def test_pending_marker_precedes_later_accepted_call_with_order_metadata(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        first_call = _tool_calls(
+            _invoke("get_weather", ("location", "true", "NYC"))
+        )
+        second_call = _tool_calls(
+            _invoke("get_weather", ("location", "true", "Tokyo"))
+        )
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        first = parser.parse_delta(first_call, [], mock_request, finished=False)
+        pending = parser.parse_delta(marker, [], mock_request, finished=False)
+        second = parser.parse_delta(second_call, [], mock_request, finished=False)
+        finish = parser.parse_delta("", [], mock_request, finished=True)
+
+        assert first is not None and first.tool_calls
+        assert pending is None
+        assert second is not None
+        assert second.content == marker
+        assert second._delta_order == ("content", "tool_calls")
+        output = collect_output([first, pending, second, finish])
+        assert output.content == marker
+        assert [call["name"] for call in output.tool_calls] == [
+            "get_weather",
+            "get_weather",
+        ]
+        assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
+            {"location": "NYC"},
+            {"location": "Tokyo"},
+        ]
+
+    def test_pending_marker_precedes_invalid_call_released_at_finish(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        first_call = _tool_calls(
+            _invoke("get_weather", ("location", "true", "NYC"))
+        )
+        incomplete = _tool_calls(
+            _invoke("missing_tool", ("location", "true", "NYC"))
+        ).replace(DSML_INVOKE_END, "").replace(DSML_TOOL_END, "")
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        first = parser.parse_delta(first_call, [], mock_request, finished=False)
+        pending = parser.parse_delta(marker, [], mock_request, finished=False)
+        incomplete_delta = parser.parse_delta(
+            incomplete, [], mock_request, finished=False
+        )
+        finish = parser.parse_delta("", [], mock_request, finished=True)
+
+        assert first is not None and first.tool_calls
+        assert pending is None
+        assert incomplete_delta is None or not incomplete_delta.tool_calls
+        assert finish is not None
+        assert finish.content == marker
+        assert finish._delta_order == ("content", "tool_calls")
+        output = collect_output([first, pending, incomplete_delta, finish])
+        assert output.content == marker
+        assert [call["name"] for call in output.tool_calls] == [
+            "get_weather",
+            INVALID_DSML_TOOL_NAME,
+        ]
+
+    def test_pending_marker_accumulates_whitespace_before_prose(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        calls = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        whitespace = "\n  \t"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        parser.parse_delta(calls, [], mock_request, finished=False)
+        assert parser.parse_delta(marker, [], mock_request, finished=False) is None
+        assert parser.parse_delta(whitespace, [], mock_request, finished=False) is None
+        result = parser.parse_delta("answer", [], mock_request, finished=True)
+
+        assert result is not None
+        assert result.content == marker + whitespace + "answer"
+
+    def test_pending_marker_and_whitespace_are_discarded_at_finish(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        calls = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        whitespace = "\n  \t"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        parser.parse_delta(calls, [], mock_request, finished=False)
+        assert parser.parse_delta(marker, [], mock_request, finished=False) is None
+        assert parser.parse_delta(whitespace, [], mock_request, finished=False) is None
+        result = parser.parse_delta("", [], mock_request, finished=True)
+
+        assert result is None or result.content is None
+        assert parser._pending_legacy_tool_marker is None
+
     def test_legacy_marker_in_tool_bearing_ordinary_prose_is_preserved(
         self, mock_tokenizer, mock_request
     ):
