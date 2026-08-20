@@ -804,6 +804,7 @@ class DeepSeekV4Parser(ParserEngine):
                 delta.content = None
             elif (
                 (delta is None or delta.content is None)
+                and not self._deferred_content
                 and event_text
                 and not event_text.strip()
             ):

@@ -1035,12 +1035,15 @@ class TestLegacyToolFramingResidue:
             _invoke("get_weather", ("location", "true", "Tokyo"))
         )
         marker = "<｜｜tool▁calls▁end｜｜>"
+        whitespace = "\n  \t"
         parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
 
         first = parser.parse_delta(first_call, [], mock_request, finished=False)
         pending = parser.parse_delta(marker, [], mock_request, finished=False)
-        second = parser.parse_delta(second_call, [], mock_request, finished=False)
-        finish = parser.parse_delta("", [], mock_request, finished=True)
+        second = parser.parse_delta(
+            second_call + whitespace, [], mock_request, finished=False
+        )
+        finish = parser.parse_delta("answer", [], mock_request, finished=True)
 
         assert first is not None and first.tool_calls
         assert pending is None
@@ -1048,7 +1051,7 @@ class TestLegacyToolFramingResidue:
         assert second.content == marker
         assert second._delta_order == ("content", "tool_calls")
         output = collect_output([first, pending, second, finish])
-        assert output.content == marker
+        assert output.content == marker + whitespace + "answer"
         assert [call["name"] for call in output.tool_calls] == [
             "get_weather",
             "get_weather",
@@ -1056,6 +1059,40 @@ class TestLegacyToolFramingResidue:
         assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
             {"location": "NYC"},
             {"location": "Tokyo"},
+        ]
+
+    def test_pending_marker_precedes_later_invalid_call_with_order_metadata(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        first_call = _tool_calls(
+            _invoke("get_weather", ("location", "true", "NYC"))
+        )
+        invalid_call = _tool_calls(
+            _invoke("missing_tool", ("location", "true", "Tokyo"))
+        )
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        whitespace = "\n  \t"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        first = parser.parse_delta(first_call, [], mock_request, finished=False)
+        pending = parser.parse_delta(marker, [], mock_request, finished=False)
+        invalid = parser.parse_delta(
+            invalid_call + whitespace, [], mock_request, finished=False
+        )
+        finish = parser.parse_delta("answer", [], mock_request, finished=True)
+
+        assert first is not None and first.tool_calls
+        assert pending is None
+        assert invalid is not None and invalid.tool_calls
+        assert invalid.content == marker
+        assert invalid._delta_order == ("content", "tool_calls")
+        output = collect_output([first, pending, invalid, finish])
+        assert output.content == marker + whitespace + "answer"
+        assert [call["name"] for call in output.tool_calls] == [
+            "get_weather",
+            INVALID_DSML_TOOL_NAME,
         ]
 
     def test_pending_marker_precedes_invalid_call_released_at_finish(
