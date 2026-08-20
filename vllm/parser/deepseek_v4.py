@@ -51,6 +51,7 @@ DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+_LEGACY_TOOL_CALLS_END = "<｜｜tool▁calls▁end｜｜>"
 INVALID_DSML_TOOL_NAME = "__invalid_dsml_tool_call__"
 
 _ESCAPED_DSML = re.escape(_DSML)
@@ -86,6 +87,7 @@ def _strip_parsed_tool_residue(text: str) -> str:
     markers = (
         f"<{_DSML}",
         f"</{_DSML}",
+        _LEGACY_TOOL_CALLS_END,
     )
     cutoffs = [text.find(marker) for marker in markers if marker in text]
     if not cutoffs:
@@ -662,7 +664,9 @@ class DeepSeekV4Parser(ParserEngine):
             delta.content = content
 
         if delta is not None and delta.content:
-            if delta.tool_calls:
+            if delta.tool_calls or (
+                finished and any(not slot.invalid for slot in self._tool_slots)
+            ):
                 delta.content = _strip_parsed_tool_residue(delta.content) or None
             if delta.content and _DSML in delta.content:
                 delta.content = _escape_unparsed_dsml(delta.content)

@@ -905,6 +905,34 @@ def _tool_calls(*invokes):
     return DSML_TOOL_START + "\n".join(invokes) + DSML_TOOL_END
 
 
+class TestLegacyToolFramingResidue:
+    def test_named_request_drops_legacy_suffix_after_v4_calls(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        tools = [tool]
+        mock_request.tools = tools
+        mock_request.tool_choice = {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }
+        calls = _tool_calls(
+            _invoke("get_weather", ("location", "true", "NYC")),
+            _invoke("get_weather", ("location", "true", "NYC")),
+        )
+        legacy_suffix = "<｜｜tool▁calls▁end｜｜>\n\n"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+
+        for text in (calls, calls + legacy_suffix):
+            _, content, tool_calls = parser.parse(text, mock_request)
+
+            assert [tool_call.name for tool_call in tool_calls or []] == [
+                "get_weather",
+                "get_weather",
+            ]
+            assert content in (None, "")
+
+
 class TestParallelUnwrapping:
     @pytest.fixture
     def weather_tool(self):
