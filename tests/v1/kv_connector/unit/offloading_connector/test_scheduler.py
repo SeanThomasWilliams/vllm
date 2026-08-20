@@ -1899,9 +1899,19 @@ def test_worker_transfer_failure_is_aggregated_across_all_ranks():
     assert 42 not in scheduler._jobs
 
 
-def test_reset_barrier_keeps_same_job_through_worker_control():
-    """Reset waits through transfer and all-rank control ACKs on one job ID."""
-    scheduler = object.__new__(OffloadingConnectorScheduler)
+def test_reset_barrier_keeps_same_job_through_worker_control(request_runner):
+    """Reset waits through transfer and all-rank control ACKs on one job ID.
+
+    Use the request runner so constructor-owned reset state stays in sync with
+    the scheduler implementation instead of reproducing it with object.__new__.
+    """
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        worker_count=3,
+    )
+    scheduler = runner.connector_scheduler
     scheduler._jobs = {
         42: TransferJobStatus(
             req_id="req",
@@ -1912,20 +1922,8 @@ def test_reset_barrier_keeps_same_job_through_worker_control():
             worker_operation="transfer",
         )
     }
-    scheduler._stale_job_threshold = 0
-    scheduler._connector_stats = OffloadingConnectorStats()
-    scheduler._reset_pending = False
-    scheduler._reset_job_ids = set()
-    scheduler._pending_worker_control_jobs = {}
-    scheduler._current_batch_load_jobs = {}
-    scheduler._current_batch_jobs_to_flush = set()
-    scheduler._current_batch_allocated_block_ids = set()
-    scheduler._block_id_to_pending_jobs = {}
-    scheduler._req_status = {}
-    scheduler._chunks_being_loaded = None
-    scheduler._events_tracker = MagicMock()
-    scheduler.manager = MagicMock()
-    scheduler.config = SimpleNamespace(num_workers=3)
+    assert scheduler._job_counter == 0
+    assert scheduler._reset_pending is False
     control = WorkerTransferJob(
         req_id="req", src_spec=MagicMock(), dst_spec=MagicMock(), operation="commit"
     )
