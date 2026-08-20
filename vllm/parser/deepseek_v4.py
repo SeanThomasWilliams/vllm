@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -427,6 +428,30 @@ class DeepSeekV4Parser(ParserEngine):
                 return text
         return None
 
+    def _preprocess_feed(
+        self,
+        delta_text: str,
+        delta_token_ids: Sequence[int],
+    ) -> tuple[str, Sequence[int]]:
+        if self.skip_tool_parsing or not delta_text or not delta_token_ids:
+            return delta_text, delta_token_ids
+
+        held = self._engine._lexer.buffer
+        if not held or not delta_text.startswith(held):
+            return delta_text, delta_token_ids
+
+        try:
+            decoded = self.model_tokenizer.decode(
+                list(delta_token_ids), skip_special_tokens=True
+            )
+        except TypeError:
+            decoded = self.model_tokenizer.decode(list(delta_token_ids))
+
+        remainder = delta_text[len(held) :]
+        if not decoded.startswith(held) and decoded == remainder:
+            return remainder, delta_token_ids
+        return delta_text, delta_token_ids
+
     def _before_finish(self) -> None:
         self._finish_invalid_slot = None
         self._finish_invalid_prefix = None
@@ -672,7 +697,11 @@ class DeepSeekV4Parser(ParserEngine):
             )
             if delta.tool_calls:
                 delta.content = _strip_parsed_tool_residue(delta.content) or None
-            if accepted_tool_call and (delta.tool_calls or finished):
+            if (
+                delta.content
+                and accepted_tool_call
+                and (delta.tool_calls or finished)
+            ):
                 delta.content = _strip_legacy_tool_calls_end(delta.content) or None
             if delta.content and _DSML in delta.content:
                 delta.content = _escape_unparsed_dsml(delta.content)
