@@ -1123,10 +1123,10 @@ def split_delta(delta: DeltaMessage) -> list[DeltaMessage]:
     """
     parts = getattr(delta, "_delta_parts", None)
     if parts:
-        deltas: list[DeltaMessage] = []
+        nested_deltas: list[DeltaMessage] = []
         for part in parts:
-            deltas.extend(split_delta(part))
-        return deltas
+            nested_deltas.extend(split_delta(part))
+        return nested_deltas
 
     has_reasoning = delta.reasoning is not None
     has_content = delta.content is not None

@@ -612,7 +612,7 @@ class DeepSeekV4Parser(ParserEngine):
                 if current:
                     released.extend(current)
                 elif slot.invalid:
-                    released.append(self._make_invalid_tool_delta(idx))
+                    released.extend(self._make_invalid_tool_delta(idx).tool_calls)
 
             # Non-closed current deltas are still tentative, except for an
             # invalid auto-close which is already safe to expose.
