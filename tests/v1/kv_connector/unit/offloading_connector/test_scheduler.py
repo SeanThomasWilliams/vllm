@@ -2277,8 +2277,12 @@ def test_engine_core_reset_and_sleep_drain_connector_barrier():
 
     core = object.__new__(EngineCore)
     core.scheduler = MagicMock()
+    core.scheduler.running = []
+    core.scheduler.waiting = []
+    core.scheduler.skipped_waiting = []
     core.scheduler.connector.has_pending_push_work.return_value = True
-    core.scheduler.reset_prefix_cache.side_effect = [False, True]
+    core.scheduler.reset_prefix_cache.return_value = False
+    core.scheduler.reset_connector_cache.return_value = True
     core.step_fn = MagicMock()
     core.reset_mm_cache = MagicMock()
     core.reset_encoder_cache = MagicMock()
@@ -2290,13 +2294,32 @@ def test_engine_core_reset_and_sleep_drain_connector_barrier():
     core.reset_encoder_cache.reset_mock()
 
     # Sleep must not proceed until its pending connector reset completes.
-    core.scheduler.reset_prefix_cache.side_effect = [False, True]
+    core.scheduler.reset_prefix_cache.return_value = False
+    core.scheduler.reset_connector_cache.return_value = True
     core.step_fn.reset_mock()
     core.model_executor = MagicMock()
     core.scheduler.finish_requests.return_value = []
     assert core.sleep(level=1, mode="keep") is None
     core.step_fn.assert_called_once_with()
     core.model_executor.sleep.assert_called_once_with(1)
+
+
+def test_engine_core_direct_reset_running_request_does_not_step():
+    """An invalid local reset returns immediately without user model work."""
+    from vllm.v1.engine.core import EngineCore
+
+    core = object.__new__(EngineCore)
+    core.scheduler = MagicMock()
+    core.scheduler.running = [object()]
+    core.scheduler.waiting = []
+    core.scheduler.skipped_waiting = []
+    core.scheduler.connector.has_pending_push_work.return_value = True
+    core.scheduler.reset_prefix_cache.return_value = False
+    core.step_fn = MagicMock()
+
+    assert core.reset_prefix_cache(reset_connector=True) is False
+    core.step_fn.assert_not_called()
+    core.scheduler.reset_connector_cache.assert_not_called()
 
 
 def test_pending_transfer_defers_prefix_lookup():

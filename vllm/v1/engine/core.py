@@ -822,14 +822,18 @@ class EngineCore:
             and self.scheduler.connector is not None
             and self.scheduler.connector.has_pending_push_work()
         ):
-            # In-process clients only advance the connector when their caller
-            # steps the engine. Drain connector-only reset work here so a direct
-            # reset or sleep cannot leave the scheduler paused indefinitely.
+            # A failed local reset with user work still present must return
+            # immediately: stepping here would execute user model work. Once
+            # the local cache reset has succeeded, only drain connector
+            # metadata in this synchronous in-process path.
+            if not reset_running_requests and any(
+                bool(getattr(self.scheduler, name, ()))
+                for name in ("running", "waiting", "skipped_waiting")
+            ):
+                return False
             while not reset_successful:
                 self.step_fn()
-                reset_successful = self.scheduler.reset_prefix_cache(
-                    False, reset_connector
-                )
+                reset_successful = self.scheduler.reset_connector_cache()
         return reset_successful
 
     def reset_encoder_cache(self) -> None:
