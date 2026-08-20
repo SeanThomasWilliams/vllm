@@ -578,46 +578,74 @@ class DeepSeekV4Parser(ParserEngine):
         events: list[SemanticEvent],
         finished: bool = False,
     ) -> DeltaMessage | None:
-        explicit_closes = {
-            event.tool_index
-            for event in events
-            if event.type == EventType.TOOL_CALL_END
-        }
+        explicit_close_order: list[int] = []
+        for event in events:
+            if (
+                event.type == EventType.TOOL_CALL_END
+                and event.tool_index not in explicit_close_order
+            ):
+                explicit_close_order.append(event.tool_index)
+        explicit_closes = set(explicit_close_order)
         delta = super()._events_to_delta(events, finished=finished)
         if self.skip_tool_parsing:
             return delta
 
-        if delta is not None and delta.tool_calls:
+        if explicit_closes or (delta is not None and delta.tool_calls):
             released: list[DeltaToolCall] = []
-            for tool_call in delta.tool_calls:
+            handled_closes: set[int] = set()
+            current_tool_calls = delta.tool_calls if delta is not None else []
+            for tool_call in current_tool_calls:
                 idx = tool_call.index
                 slot = self._tool_slots[idx]
                 if idx in explicit_closes:
-                    # The base engine has already applied the close.  A
+                    # The base engine has already applied the close. A
                     # malformed or unknown call is represented only by its
                     # replacement sentinel; never release its tentative
                     # requested name or arguments.
-                    if slot.invalid:
-                        self._tentative_tool_deltas.pop(idx, None)
-                    else:
-                        released.extend(self._tentative_tool_deltas.pop(idx, []))
+                    if idx not in handled_closes:
+                        if slot.invalid:
+                            self._tentative_tool_deltas.pop(idx, None)
+                        else:
+                            released.extend(self._tentative_tool_deltas.pop(idx, []))
+                        handled_closes.add(idx)
                     released.append(tool_call)
                 elif slot.invalid:
                     # This is an auto-close generated while finishing a
-                    # partial call.  The invalid delta is the only safe
+                    # partial call. The invalid delta is the only safe
                     # output for this slot.
                     self._tentative_tool_deltas.pop(idx, None)
                     released.append(tool_call)
                 else:
                     self._tentative_tool_deltas.setdefault(idx, []).append(tool_call)
 
-            delta.tool_calls = released
-            if (
-                not delta.tool_calls
-                and delta.content is None
-                and delta.reasoning is None
-            ):
-                delta = None
+            # A close can be semantically complete even when the base
+            # converter has no final fragment to append. Release every
+            # independently closed slot, not just slots represented by a
+            # current DeltaToolCall.
+            for idx in explicit_close_order:
+                if idx in handled_closes:
+                    continue
+                if idx < 0 or idx >= len(self._tool_slots):
+                    continue
+                slot = self._tool_slots[idx]
+                if slot.invalid:
+                    self._tentative_tool_deltas.pop(idx, None)
+                    released.append(self._make_invalid_tool_delta(idx))
+                else:
+                    released.extend(self._tentative_tool_deltas.pop(idx, []))
+
+            if delta is None and released:
+                from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+
+                delta = DeltaMessage(tool_calls=released)
+            elif delta is not None:
+                delta.tool_calls = released
+                if (
+                    not delta.tool_calls
+                    and delta.content is None
+                    and delta.reasoning is None
+                ):
+                    delta = None
 
         has_tool_calls = bool(delta is not None and delta.tool_calls)
         content = delta.content if delta is not None else None

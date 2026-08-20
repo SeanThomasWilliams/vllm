@@ -510,6 +510,30 @@ class TestPostToolContentDeferral:
         assert merged._delta_order == ("tool_calls", "content")
         assert "_delta_order" not in merged.model_dump()
 
+    def test_terminal_merge_keeps_repeated_content_segments(self):
+        engine = _make_engine()
+        prefix = DeltaMessage(content="before")
+        tool = DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=0,
+                    function=DeltaFunctionCall(name="f", arguments="{}"),
+                )
+            ]
+        )
+        trailing = DeltaMessage(content="after")
+
+        merged = engine._merge_deltas(engine._merge_deltas(prefix, tool), trailing)
+
+        assert merged.content == "beforeafter"
+        assert merged._delta_parts is not None
+        assert [part.content for part in merged._delta_parts] == [
+            "before",
+            None,
+            "after",
+        ]
+        assert "_delta_parts" not in merged.model_dump()
+
     def test_text_after_tool_end_deferred(self):
         engine = _make_engine()
         events = [

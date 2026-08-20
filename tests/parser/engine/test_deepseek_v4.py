@@ -35,6 +35,7 @@ from vllm.parser.deepseek_v4 import (
     _unwrap_wrapper_args,
     deepseek_v4_config,
 )
+from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
@@ -486,6 +487,33 @@ class TestTentativeToolStreaming:
         )
         assert json.loads(arguments) == {"location": "NYC"}
         assert parser.finish_streaming() is None
+
+    def test_explicit_close_releases_buffer_when_converter_has_no_delta(
+        self, mock_tokenizer, mock_request
+    ):
+        request = self._request_with_weather(mock_request)
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=request.tools)
+        events = [
+            SemanticEvent(EventType.TOOL_CALL_START, tool_index=0),
+            SemanticEvent(EventType.TOOL_NAME, "get_weather", tool_index=0),
+            SemanticEvent(
+                EventType.ARG_VALUE_CHUNK,
+                _param("location", "true", "NYC"),
+                tool_index=0,
+            ),
+        ]
+
+        assert parser._events_to_delta(events) is None
+        buffered = list(parser._tentative_tool_deltas[0])
+        parser._tool_slots[0].streamed_json = parser._convert_args_for_slot(0, False)
+
+        delta = parser._events_to_delta(
+            [SemanticEvent(EventType.TOOL_CALL_END, tool_index=0)]
+        )
+
+        assert delta is not None
+        assert delta.tool_calls == buffered
+        assert delta.tool_calls[0].function.name == "get_weather"
 
     def test_valid_parallel_sibling_survives_other_sibling_eos_invalidation(
         self, mock_tokenizer, mock_request

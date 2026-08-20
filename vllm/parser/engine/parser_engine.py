@@ -249,7 +249,18 @@ class ParserEngine(Parser):
                 )
                 if present and field not in field_order:
                     field_order.append(field)
+
+        def flatten_parts(delta: DeltaMessage) -> tuple[DeltaMessage, ...]:
+            parts = getattr(delta, "_delta_parts", None)
+            if not parts:
+                return (delta,)
+            flattened: list[DeltaMessage] = []
+            for part in parts:
+                flattened.extend(flatten_parts(part))
+            return tuple(flattened)
+
         merged._delta_order = tuple(field_order)
+        merged._delta_parts = flatten_parts(first) + flatten_parts(second)
         return merged
 
     def _finish_streaming_delta(self) -> DeltaMessage | None:

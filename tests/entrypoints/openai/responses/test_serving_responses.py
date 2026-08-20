@@ -1200,6 +1200,56 @@ class TestAutoToolStreaming:
 
     @pytest.mark.skip_global_cleanup
     @pytest.mark.asyncio
+    async def test_terminal_merge_preserves_prefix_tool_trailing_order(
+        self, monkeypatch
+    ):
+        """Responses must emit prefix content, tool, then trailing content."""
+        monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+
+        tool_call = DeltaToolCall(
+            id="call_weather",
+            type="function",
+            index=0,
+            function=DeltaFunctionCall(
+                name="get_weather", arguments='{"location":"Berlin"}'
+            ),
+        )
+        prefix = DeltaMessage(content="before")
+        tool = DeltaMessage(tool_calls=[tool_call])
+        trailing = DeltaMessage(content="after")
+        merged = DeltaMessage(content="beforeafter", tool_calls=[tool_call])
+        merged._delta_parts = (prefix, tool, trailing)
+
+        events = await self._collect_events([merged])
+        types = [event.type for event in events]
+
+        assert types == [
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+        ]
+        assert [
+            event.delta
+            for event in events
+            if event.type
+            in {"response.output_text.delta", "response.function_call_arguments.delta"}
+        ] == ["before", '{"location":"Berlin"}', "after"]
+
+    @pytest.mark.skip_global_cleanup
+    @pytest.mark.asyncio
     async def test_compound_content_and_tool_name_args_same_delta(self, monkeypatch):
         monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
 

@@ -1121,6 +1121,13 @@ def split_delta(delta: DeltaMessage) -> list[DeltaMessage]:
     deltas use reasoning -> content -> tool_calls. Tool calls remain grouped
     by index so one item can carry its name and arguments together.
     """
+    parts = getattr(delta, "_delta_parts", None)
+    if parts:
+        deltas: list[DeltaMessage] = []
+        for part in parts:
+            deltas.extend(split_delta(part))
+        return deltas
+
     has_reasoning = delta.reasoning is not None
     has_content = delta.content is not None
     has_tools = bool(delta.tool_calls)

@@ -398,10 +398,11 @@ class DeltaMessage(OpenAIBaseModel):
     reasoning: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
 
-    # Parser/serving-only metadata. A terminal merge can combine fields
-    # from sequential parser deltas; Responses must consume those fields in
-    # their original order, while this marker must never reach the API.
+    # Parser/serving-only metadata. Terminal merges can combine fields or
+    # repeated content segments from sequential parser deltas; Responses must
+    # consume them in order, while these markers never reach the API.
     _delta_order: tuple[str, ...] | None = PrivateAttr(default=None)
+    _delta_parts: tuple[Any, ...] | None = PrivateAttr(default=None)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
