@@ -226,11 +226,12 @@ def test_trace_filters_nonproduction_unusable_proposals(
     speculator._has_unaligned_cached_prefix = Mock(return_value=unaligned)
     speculator._emit_proposal_trace = Mock(side_effect=lambda: events.append("emit"))
     input_batch = SimpleNamespace(num_reqs=1)
-    monkeypatch.setattr(
-        speculator_module.DFlashSpeculator,
-        "propose",
-        lambda self, *_args, **_kwargs: events.append("super") or "draft",
-    )
+
+    def replay(_self: object, *_args: object, **_kwargs: object) -> str:
+        events.append("super")
+        return "draft"
+
+    monkeypatch.setattr(speculator_module.DFlashSpeculator, "propose", replay)
 
     result = DSparkSpeculator.propose(speculator, input_batch, **kwargs)
 

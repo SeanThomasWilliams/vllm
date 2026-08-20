@@ -989,7 +989,7 @@ def test_filtered_persistent_topk_clamps_lengths_for_large_batch() -> None:
     """The >32-row filtered path must stay within each row's available width."""
     torch.set_default_device("cuda:0")
     max_smem = getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        torch.cuda.get_device_properties(torch.accelerator.current_device_index()),
         "shared_memory_per_block_optin",
         0,
     )
@@ -1031,7 +1031,7 @@ def test_filtered_persistent_topk_clamps_underreported_max_seq_len() -> None:
     """Filtered top-k must use physical rows with a smaller logical bound."""
     torch.set_default_device("cuda:0")
     max_smem = getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        torch.cuda.get_device_properties(torch.accelerator.current_device_index()),
         "shared_memory_per_block_optin",
         0,
     )
