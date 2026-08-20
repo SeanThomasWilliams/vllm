@@ -8,8 +8,6 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any
 
-from typing_extensions import override
-
 from vllm.v1.kv_offload.base import LoadStoreSpec
 
 
@@ -51,7 +49,6 @@ class FileSystemLoadStoreSpec(LoadStoreSpec):
     run_config: dict[str, Any] | None = None
 
     @staticmethod
-    @override
     def medium() -> str:
         return "file_system"
 
@@ -67,7 +64,6 @@ class FileSystemLookupSpec(LoadStoreSpec):
     run_config: dict[str, Any] | None = None
 
     @staticmethod
-    @override
     def medium() -> str:
         return "file_system_lookup"
 
@@ -85,6 +81,5 @@ class FileSystemControlSpec(LoadStoreSpec):
     run_config: dict[str, Any] | None = None
 
     @staticmethod
-    @override
     def medium() -> str:
         return "file_system_control"

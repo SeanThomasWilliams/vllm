@@ -264,9 +264,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
-        self.retain_primary_cache = self.extra_config.get(
-            "retain_primary_cache", True
-        )
+        self.retain_primary_cache = self.extra_config.get("retain_primary_cache", True)
         if not isinstance(self.retain_primary_cache, bool):
             raise ValueError("retain_primary_cache must be a boolean")
         if not self.retain_primary_cache and not self.secondary_tier_configs:

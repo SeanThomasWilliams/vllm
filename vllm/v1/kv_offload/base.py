@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
         OffloadingConnectorStats,
     )
+    from vllm.v1.kv_offload.tiering.base import WorkerTransferSpec
 
 from vllm.v1.kv_offload.config import OffloadingConfig
 
@@ -380,6 +381,22 @@ class OffloadingManager(ABC):
         to be called even when no requests are scheduled.
         """
         return False
+
+    def complete_worker_lookup(self, job_id: int, success: bool) -> None:
+        """Complete a scheduler-dispatched worker lookup, if supported."""
+        raise NotImplementedError
+
+    def complete_worker_transfer(
+        self, job_id: int, success: bool
+    ) -> "WorkerTransferSpec | None":
+        """Complete a scheduler-dispatched worker transfer, if supported."""
+        raise NotImplementedError
+
+    def complete_worker_control(
+        self, job_id: int, success: bool
+    ) -> "WorkerTransferSpec | None":
+        """Complete a scheduler-dispatched worker control step, if supported."""
+        raise NotImplementedError
 
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""

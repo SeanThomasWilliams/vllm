@@ -1020,7 +1020,9 @@ class CPUOffloadingWorker(OffloadingWorker):
             rank = (
                 self._parallel_rank
                 if self._parallel_rank is not None
-                else self._mmap_region.rank if self._mmap_region is not None else None
+                else self._mmap_region.rank
+                if self._mmap_region is not None
+                else None
             )
             if self._mmap_region is None or rank is None:
                 raise RuntimeError(
