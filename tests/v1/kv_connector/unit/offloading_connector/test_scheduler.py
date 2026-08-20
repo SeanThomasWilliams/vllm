@@ -1942,6 +1942,12 @@ def test_reset_barrier_keeps_same_job_through_worker_control():
     assert scheduler._jobs[42].worker_operation == "commit"
     assert not scheduler.manager.reset_cache.called
 
+    # Dispatch the spawned control metadata before accepting its ACKs. The
+    # pending table contains unsent controls only and must be empty in flight.
+    reset_meta = scheduler._build_reset_metadata()
+    assert 42 in reset_meta.worker_transfer_jobs
+    assert scheduler._pending_worker_control_jobs == {}
+
     scheduler.update_connector_output(
         KVConnectorOutput(
             kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={42: 3})
