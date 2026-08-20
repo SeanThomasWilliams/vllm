@@ -36,6 +36,7 @@ from vllm.parser.deepseek_v4 import (
     deepseek_v4_config,
 )
 from vllm.parser.engine.events import EventType, SemanticEvent
+from vllm.parser.engine.parser_engine_config import ParserState
 from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
@@ -966,6 +967,62 @@ class TestLegacyToolFramingResidue:
         ]
         assert suffix_delta is None or suffix_delta.content is None
 
+    def test_streaming_marker_only_delta_is_held_until_finish(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        calls = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        marker = "<｜｜tool▁calls▁end｜｜>"
+
+        calls_delta = parser.parse_delta(calls, [], mock_request, finished=False)
+        marker_delta = parser.parse_delta(
+            marker + "\n\n", [], mock_request, finished=False
+        )
+        finish_delta = parser.parse_delta("", [], mock_request, finished=True)
+
+        assert calls_delta is not None and calls_delta.tool_calls
+        assert marker_delta is None or marker_delta.content is None
+        assert finish_delta is None or finish_delta.content is None
+
+    def test_streaming_marker_only_delta_is_preserved_before_later_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        calls = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        marker = "<｜｜tool▁calls▁end｜｜>"
+
+        parser.parse_delta(calls, [], mock_request, finished=False)
+        assert parser.parse_delta(marker, [], mock_request, finished=False) is None
+        later = parser.parse_delta(" ordinary", [], mock_request, finished=True)
+
+        assert later is not None
+        assert later.content == marker + " ordinary"
+
+    def test_streaming_marker_pending_state_resets(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        calls = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        parser = DeepSeekV4Parser(
+            mock_tokenizer,
+            tools=[tool],
+            chat_template_kwargs={"thinking": False},
+        )
+        marker = "<｜｜tool▁calls▁end｜｜>"
+
+        parser.parse_delta(calls, [], mock_request, finished=False)
+        parser.parse_delta(marker, [], mock_request, finished=False)
+        parser._reset()
+        result = parser.parse_delta("ordinary", [], mock_request, finished=True)
+
+        assert result is not None
+        assert result.content == "ordinary"
+
     def test_legacy_marker_in_tool_bearing_ordinary_prose_is_preserved(
         self, mock_tokenizer, mock_request
     ):
@@ -1012,6 +1069,36 @@ class TestLegacyToolFramingResidue:
 
         assert tool_calls is None
         assert content == legacy_marker
+
+    def test_streaming_legacy_marker_without_tool_calls_is_preserved(
+        self, mock_tokenizer, mock_request
+    ):
+        legacy_marker = "<｜｜tool▁calls▁end｜｜>"
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
+
+        delta = parser.parse_delta(
+            legacy_marker, [], mock_request, finished=True
+        )
+
+        assert delta is not None
+        assert delta.content == legacy_marker
+
+    def test_streaming_mixed_marker_and_prose_is_preserved(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        marker = "<｜｜tool▁calls▁end｜｜>"
+        text = _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+        text += " ordinary " + marker
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+
+        delta = parser.parse_delta(text, [], mock_request, finished=True)
+
+        assert delta is not None
+        assert delta.content == " ordinary " + marker
 
 
 class TestParallelUnwrapping:
@@ -1316,6 +1403,47 @@ _DSV4_FULL_VOCAB = {
 }
 
 
+class _ContextualTokenizer:
+    """Tokenizer fixture whose token text depends on preceding IDs."""
+
+    def __init__(self):
+        self._vocab = {
+            DSML_THINK_START: 10,
+            DSML_THINK_END: 11,
+            DSML_TOOL_START: 12,
+            DSML_TOOL_END: 13,
+            "<eos>": 99,
+        }
+        self.all_special_tokens = list(self._vocab)
+        self.all_special_ids = list(self._vocab.values())
+
+    def get_vocab(self):
+        return self._vocab
+
+    def decode(self, ids, skip_special_tokens=False):
+        if skip_special_tokens:
+            ids = [tid for tid in ids if tid not in self.all_special_ids]
+        ids = tuple(ids)
+        if ids == (1,):
+            return "前"
+        if ids == (1, 2):
+            return "前“"
+        if ids == (2,):
+            return "context-only-token"
+        if ids == (3,):
+            return "界"
+        if ids == (3, 4):
+            return "界你好"
+        if ids == (4,):
+            return "context-only-token"
+        return "".join(
+            {1: "前", 2: "context-only-token", 3: "界", 4: "你好"}.get(
+                tid, ""
+            )
+            for tid in ids
+        )
+
+
 class _DeepSeekV4Delegating(DelegatingParser):
     reasoning_parser_cls = DeepSeekV4ParserReasoningAdapter
     tool_parser_cls = DeepSeekV4ParserToolAdapter
@@ -1368,6 +1496,51 @@ def _dsv4_tokens(
     tokens.append((_DSV4_FULL_VOCAB[DSML_TOOL_END], DSML_TOOL_END))
 
     return tokens
+
+
+class TestDeepSeekToolStreamingHoldback:
+    def _parser(self, held: str) -> DeepSeekV4Parser:
+        parser = DeepSeekV4Parser(
+            _ContextualTokenizer(),
+            chat_template_kwargs={"thinking": False},
+        )
+        parser.initialize_streaming(initial_state=ParserState.CONTENT)
+        parser._engine._lexer.buffer = held
+        return parser
+
+    def _content(
+        self,
+        held: str,
+        raw: str,
+        previous_token_ids: list[int],
+        current_token_ids: list[int],
+        delta_token_ids: list[int],
+    ) -> str:
+        delta = self._parser(held).extract_tool_calls_streaming(
+            previous_text="",
+            current_text="",
+            delta_text=raw,
+            previous_token_ids=previous_token_ids,
+            current_token_ids=current_token_ids,
+            delta_token_ids=delta_token_ids,
+            request=_test_request(),
+        )
+        return delta.content if delta and delta.content else ""
+
+    @pytest.mark.parametrize("raw", ["“", "““"], ids=["current", "overlap"])
+    def test_quote_prefix_and_overlap_forms(self, raw):
+        assert self._content("“", raw, [1], [1, 2], [2]) == "““"
+
+    def test_contextual_multibyte_suffix_and_angle_holdback(self):
+        assert self._content("<", "<你好", [3], [3, 4], [4]) == "<你好"
+
+    def test_eos_special_and_empty_id_paths_fail_closed(self):
+        parser = self._parser("<")
+        assert parser._normalize_tool_delta("<", [3], [3, 99]) == ""
+        assert parser._normalize_tool_delta("<raw", [], []) == "<raw"
+
+    def test_ambiguous_context_does_not_remove_holdback(self):
+        assert self._content("“", "“界", [1, 2], [3], [3]) == "““界"
 
 
 class TestDelegatingParserLargeDelta:

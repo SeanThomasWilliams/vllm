@@ -36,7 +36,9 @@ from vllm.parser.engine.parser_engine_config import (
 from vllm.tool_parsers.utils import find_tool_name, find_tool_properties
 
 if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.engine.protocol import DeltaMessage, DeltaToolCall
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
     from vllm.tokenizers import TokenizerLike
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
@@ -364,6 +366,7 @@ class DeepSeekV4Parser(ParserEngine):
         )
         self._arg_converter = self._convert_args
         self._pending_stray_tool_framing: str | None = None
+        self._pending_legacy_tool_marker: str | None = None
         self._invalid_tool_names: set[str] = set()
         self._tentative_tool_deltas: dict[int, list[DeltaToolCall]] = {}
         self._finish_invalid_slot: int | None = None
@@ -372,6 +375,7 @@ class DeepSeekV4Parser(ParserEngine):
     def _reset(self, initial_state: ParserState | None = None) -> None:
         super()._reset(initial_state=initial_state)
         self._pending_stray_tool_framing = None
+        self._pending_legacy_tool_marker = None
         self._invalid_tool_names.clear()
         self._tentative_tool_deltas.clear()
         self._finish_invalid_slot = None
@@ -428,29 +432,72 @@ class DeepSeekV4Parser(ParserEngine):
                 return text
         return None
 
-    def _preprocess_feed(
+    def _decode_stream_context(
+        self, token_ids: Sequence[int]
+    ) -> str | None:
+        try:
+            return self.model_tokenizer.decode(
+                list(token_ids), skip_special_tokens=True
+            )
+        except Exception:
+            try:
+                special_ids = set(self.model_tokenizer.all_special_ids)
+            except (AttributeError, NotImplementedError):
+                special_ids = set()
+            try:
+                return self.model_tokenizer.decode(
+                    [token_id for token_id in token_ids if token_id not in special_ids]
+                )
+            except Exception:
+                return None
+
+    def _normalize_tool_delta(
         self,
         delta_text: str,
-        delta_token_ids: Sequence[int],
-    ) -> tuple[str, Sequence[int]]:
-        if self.skip_tool_parsing or not delta_text or not delta_token_ids:
-            return delta_text, delta_token_ids
-
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+    ) -> str:
+        """Remove text duplicated by the lexer holdback at the tool seam."""
         held = self._engine._lexer.buffer
-        if not held or not delta_text.startswith(held):
-            return delta_text, delta_token_ids
+        if not held or not delta_text or not current_token_ids:
+            return delta_text
 
-        try:
-            decoded = self.model_tokenizer.decode(
-                list(delta_token_ids), skip_special_tokens=True
-            )
-        except TypeError:
-            decoded = self.model_tokenizer.decode(list(delta_token_ids))
+        decoded_previous = self._decode_stream_context(previous_token_ids)
+        decoded_current = self._decode_stream_context(current_token_ids)
+        if decoded_previous is None or decoded_current is None:
+            return delta_text
+        if not decoded_current.startswith(decoded_previous):
+            return delta_text
 
-        remainder = delta_text[len(held) :]
-        if not decoded.startswith(held) and decoded == remainder:
-            return remainder, delta_token_ids
-        return delta_text, delta_token_ids
+        expected = decoded_current[len(decoded_previous) :]
+        if delta_text == held + expected:
+            return expected
+        return delta_text
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> DeltaMessage | None:
+        delta_text = self._normalize_tool_delta(
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+        )
+        return super().extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
+        )
 
     def _before_finish(self) -> None:
         self._finish_invalid_slot = None
@@ -516,6 +563,7 @@ class DeepSeekV4Parser(ParserEngine):
         self._finish_invalid_slot = None
         self._finish_invalid_prefix = None
         self._pending_stray_tool_framing = None
+        self._pending_legacy_tool_marker = None
 
         if invalid_slot is not None:
             if not self._delta_has_tool_index(delta, invalid_slot):
@@ -691,20 +739,45 @@ class DeepSeekV4Parser(ParserEngine):
         elif delta is not None:
             delta.content = content
 
+        accepted_tool_call = any(
+            slot.name_sent and not slot.invalid for slot in self._tool_slots
+        )
         if delta is not None and delta.content:
-            accepted_tool_call = any(
-                slot.name_sent and not slot.invalid for slot in self._tool_slots
-            )
             if delta.tool_calls:
                 delta.content = _strip_parsed_tool_residue(delta.content) or None
-            if (
-                delta.content
-                and accepted_tool_call
-                and (delta.tool_calls or finished)
-            ):
-                delta.content = _strip_legacy_tool_calls_end(delta.content) or None
+            if accepted_tool_call:
+                if delta.content and not delta.tool_calls:
+                    content = delta.content
+                    if content.strip() == _LEGACY_TOOL_CALLS_END:
+                        if finished:
+                            content = None
+                        else:
+                            self._pending_legacy_tool_marker = content
+                            content = None
+                    elif self._pending_legacy_tool_marker is not None:
+                        if content.strip():
+                            content = self._pending_legacy_tool_marker + content
+                            self._pending_legacy_tool_marker = None
+                        elif finished:
+                            self._pending_legacy_tool_marker = None
+                            content = None
+                        else:
+                            content = None
+                    delta.content = content
+                if (
+                    delta.content
+                    and (delta.tool_calls or finished)
+                ):
+                    delta.content = _strip_legacy_tool_calls_end(delta.content) or None
             if delta.content and _DSML in delta.content:
                 delta.content = _escape_unparsed_dsml(delta.content)
+        if (
+            delta is not None
+            and delta.content is None
+            and not delta.tool_calls
+            and delta.reasoning is None
+        ):
+            return None
         return delta
 
     def _repair_malformed_tool_slot(self, idx: int) -> None:
