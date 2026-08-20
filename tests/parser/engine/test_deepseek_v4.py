@@ -906,7 +906,35 @@ def _tool_calls(*invokes):
 
 
 class TestLegacyToolFramingResidue:
+    @pytest.mark.parametrize("locations", [("NYC",), ("NYC", "Tokyo")])
     def test_named_request_drops_legacy_suffix_after_v4_calls(
+        self, mock_tokenizer, mock_request, locations
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        tools = [tool]
+        mock_request.tools = tools
+        mock_request.tool_choice = {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }
+        calls = _tool_calls(
+            *(
+                _invoke("get_weather", ("location", "true", location))
+                for location in locations
+            )
+        )
+        legacy_suffix = "<｜｜tool▁calls▁end｜｜>\n\n"
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+
+        _, content, tool_calls = parser.parse(calls + legacy_suffix, mock_request)
+
+        assert [
+            (tool_call.name, json.loads(tool_call.arguments))
+            for tool_call in tool_calls or []
+        ] == [("get_weather", {"location": location}) for location in locations]
+        assert content in (None, "")
+
+    def test_streaming_deferred_final_suffix_is_removed_after_accepted_calls(
         self, mock_tokenizer, mock_request
     ):
         tool = _make_tool("get_weather", {"location": {"type": "string"}})
@@ -918,19 +946,72 @@ class TestLegacyToolFramingResidue:
         }
         calls = _tool_calls(
             _invoke("get_weather", ("location", "true", "NYC")),
-            _invoke("get_weather", ("location", "true", "NYC")),
+            _invoke("get_weather", ("location", "true", "Tokyo")),
         )
         legacy_suffix = "<｜｜tool▁calls▁end｜｜>\n\n"
         parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
 
-        for text in (calls, calls + legacy_suffix):
+        calls_delta = parser.parse_delta(calls, [], mock_request, finished=False)
+        suffix_delta = parser.parse_delta(
+            legacy_suffix, [], mock_request, finished=True
+        )
+
+        assert calls_delta is not None
+        assert [
+            (tool_call.function.name, json.loads(tool_call.function.arguments))
+            for tool_call in calls_delta.tool_calls
+        ] == [
+            ("get_weather", {"location": "NYC"}),
+            ("get_weather", {"location": "Tokyo"}),
+        ]
+        assert suffix_delta is None or suffix_delta.content is None
+
+    def test_legacy_marker_in_tool_bearing_ordinary_prose_is_preserved(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        tools = [tool]
+        mock_request.tools = tools
+        legacy_marker = "<｜｜tool▁calls▁end｜｜>"
+        call = _invoke("get_weather", ("location", "true", "NYC"))
+        cases = (
+            (
+                f"{legacy_marker} mentioned before {call}",
+                f"{legacy_marker} mentioned before ",
+            ),
+            (
+                f"{_tool_calls(call)} ordinary {legacy_marker} prose",
+                f" ordinary {legacy_marker} prose",
+            ),
+            (
+                f"{_tool_calls(call)} ordinary {legacy_marker}",
+                f" ordinary {legacy_marker}",
+            ),
+        )
+
+        for text, expected_content in cases:
+            parser = DeepSeekV4Parser(
+                mock_tokenizer,
+                tools=tools,
+                chat_template_kwargs={"thinking": False},
+            )
             _, content, tool_calls = parser.parse(text, mock_request)
 
-            assert [tool_call.name for tool_call in tool_calls or []] == [
-                "get_weather",
-                "get_weather",
-            ]
-            assert content in (None, "")
+            assert len(tool_calls or []) == 1
+            assert content == expected_content
+
+    def test_legacy_marker_without_tool_calls_is_preserved(
+        self, mock_tokenizer, mock_request
+    ):
+        legacy_marker = "<｜｜tool▁calls▁end｜｜>"
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
+
+        _, content, tool_calls = parser.parse(legacy_marker, mock_request)
+
+        assert tool_calls is None
+        assert content == legacy_marker
 
 
 class TestParallelUnwrapping:

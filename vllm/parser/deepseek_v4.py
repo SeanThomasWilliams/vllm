@@ -84,15 +84,18 @@ def _strip_parsed_tool_preamble(text: str) -> str:
 def _strip_parsed_tool_residue(text: str) -> str:
     """Drop DSML framing residue beside an accepted tool call."""
     text = _strip_parsed_tool_preamble(text)
-    markers = (
-        f"<{_DSML}",
-        f"</{_DSML}",
-        _LEGACY_TOOL_CALLS_END,
-    )
+    markers = (f"<{_DSML}", f"</{_DSML}")
     cutoffs = [text.find(marker) for marker in markers if marker in text]
     if not cutoffs:
         return text
     return text[: min(cutoffs)].rstrip()
+
+
+def _strip_legacy_tool_calls_end(text: str) -> str:
+    """Drop the exact legacy end marker when it is the complete content."""
+    if text.strip() == _LEGACY_TOOL_CALLS_END:
+        return ""
+    return text
 
 
 def _resolve_stray_tool_framing(
@@ -664,10 +667,13 @@ class DeepSeekV4Parser(ParserEngine):
             delta.content = content
 
         if delta is not None and delta.content:
-            if delta.tool_calls or (
-                finished and any(not slot.invalid for slot in self._tool_slots)
-            ):
+            accepted_tool_call = any(
+                slot.name_sent and not slot.invalid for slot in self._tool_slots
+            )
+            if delta.tool_calls:
                 delta.content = _strip_parsed_tool_residue(delta.content) or None
+            if accepted_tool_call and (delta.tool_calls or finished):
+                delta.content = _strip_legacy_tool_calls_end(delta.content) or None
             if delta.content and _DSML in delta.content:
                 delta.content = _escape_unparsed_dsml(delta.content)
         return delta
