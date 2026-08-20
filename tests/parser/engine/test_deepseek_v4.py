@@ -1348,6 +1348,62 @@ class TestDelegatingParserLargeDelta:
         args = json.loads(output.tool_calls[0]["arguments"])
         assert args == {"location": "Berlin", "units": "celsius"}
 
+    def test_verbatim_content_does_not_duplicate_held_terminal_prefix(self):
+        eos_text = "<｜end▁of▁sentence｜>"
+        token_ids = [
+            128822,
+            24313,
+            19995,
+            16562,
+            13400,
+            10177,
+            10499,
+            3362,
+            21,
+            95,
+            1,
+        ]
+        token_texts = [
+            DSML_THINK_END,
+            '{"',
+            "answer",
+            '\":\"',
+            "beta",
+            '\",\"',
+            "count",
+            '\":',
+            "3",
+            "}",
+            eos_text,
+        ]
+        parser = _DeepSeekV4Delegating(
+            MockTokenizer(
+                vocab={DSML_THINK_END: 128822, eos_text: 1},
+                tokens=list(zip(token_ids, token_texts)),
+            ),
+            chat_template_kwargs={"thinking": True},
+        )
+        request = _test_request()
+        chunks = [
+            (DSML_THINK_END + '{"answer":"beta","', token_ids[:6]),
+            ('count":3}', token_ids[6:]),
+        ]
+
+        deltas = [
+            parser.parse_delta(
+                chunk,
+                ids,
+                request,
+                prompt_token_ids=[] if index == 0 else None,
+                finished=index == len(chunks) - 1,
+            )
+            for index, (chunk, ids) in enumerate(chunks)
+        ]
+
+        content = collect_output(deltas).content
+        assert content == '{"answer":"beta","count":3}'
+        assert json.loads(content) == {"answer": "beta", "count": 3}
+
     def test_eos_drop_token_does_not_swallow_tool_calls(self):
         """Tool calls must survive when an EOS DROP token's ID is in
         delta_token_ids but its text is absent from delta_text.

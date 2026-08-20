@@ -565,6 +565,9 @@ class DeepSeekV4Parser(ParserEngine):
         if end_idx < 0:
             return delta
         exact_content = delta_text[end_idx + len(DSML_THINK_END) :]
+        held = self._engine._lexer.buffer
+        if held and exact_content.endswith(held):
+            exact_content = exact_content[: -len(held)]
         if delta is None and exact_content:
             from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 
