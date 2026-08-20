@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     model_serializer,
     model_validator,
 )
@@ -396,6 +397,11 @@ class DeltaMessage(OpenAIBaseModel):
     content: str | None = None
     reasoning: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+    # Parser/serving-only metadata. A terminal merge can combine fields
+    # from sequential parser deltas; Responses must consume those fields in
+    # their original order, while this marker must never reach the API.
+    _delta_order: tuple[str, ...] | None = PrivateAttr(default=None)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

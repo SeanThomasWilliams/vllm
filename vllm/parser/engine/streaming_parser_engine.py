@@ -383,6 +383,12 @@ class StreamingParserEngine:
         if transition.skip_in_token_id_mode and self._ever_had_token_ids:
             return self._emit_for_state(value)
 
+        if (
+            self.skip_tool_parsing
+            and terminal in self.config.skip_tool_parsing_preserve_terminals
+        ):
+            return self._emit_for_state(value)
+
         return self._apply_transition(transition, value)
 
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:

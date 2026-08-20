@@ -21,6 +21,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
+    DeltaMessage,
     DeltaToolCall,
     FunctionDefinition,
 )
@@ -487,7 +488,27 @@ class TestPostToolContentDeferral:
     """Regression: content after TOOL_CALL_END in the same batch must not
     produce a mixed DeltaMessage(content=..., tool_calls=...) — that causes
     split_delta to reorder content before tool_calls, breaking the Responses
-    API state machine."""
+    API state machine. Terminal merges preserve the same order across ticks.
+    """
+
+    def test_terminal_merge_records_delivery_order(self):
+        engine = _make_engine()
+        tool_delta = DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=0,
+                    function=DeltaFunctionCall(
+                        name="get_weather", arguments='{"city":"NYC"}'
+                    ),
+                )
+            ]
+        )
+        content_delta = DeltaMessage(content="after the call")
+
+        merged = engine._merge_deltas(tool_delta, content_delta)
+
+        assert merged._delta_order == ("tool_calls", "content")
+        assert "_delta_order" not in merged.model_dump()
 
     def test_text_after_tool_end_deferred(self):
         engine = _make_engine()

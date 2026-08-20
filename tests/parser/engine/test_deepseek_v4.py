@@ -401,6 +401,7 @@ class TestMissingInvokeEnd:
         assert delta is not None
         assert delta.content == "Done."
         assert delta.tool_calls[0].function.name == "get_weather"
+        assert delta._delta_order == ("tool_calls", "content")
 
 
 # ── Thinking mode initial state ──────────────────────────────────────
@@ -424,6 +425,94 @@ class TestAdapterFinishRecovery:
         assert result.tool_calls[0].function.name not in {
             tool.function.name for tool in tools
         }
+
+
+class TestTentativeToolStreaming:
+    def _request_with_weather(self, mock_request):
+        tool = _make_tool("get_weather", {"location": {"type": "string"}})
+        mock_request.tools = [tool]
+        return mock_request
+
+    def test_incomplete_call_never_streams_requested_name_or_arguments(
+        self, mock_tokenizer, mock_request
+    ):
+        request = self._request_with_weather(mock_request)
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=request.tools)
+        partial = (
+            _tool_calls(_invoke("get_weather", ("location", "true", "NYC")))
+            .replace(DSML_INVOKE_END, "")
+            .replace(DSML_TOOL_END, "")
+        )
+
+        first = parser.extract_tool_calls_streaming(
+            "", partial, partial, [], [], [], request
+        )
+        final = parser.finish_streaming()
+
+        assert first is None or not first.tool_calls
+        assert final is not None
+        assert len(final.tool_calls) == 1
+        tool_call = final.tool_calls[0]
+        assert tool_call.function.name != "get_weather"
+        arguments = json.loads(tool_call.function.arguments)
+        assert arguments["error"]
+        assert arguments["tool_name"] == "get_weather"
+        assert "location" not in arguments
+
+    def test_explicit_close_releases_buffered_call_once(
+        self, mock_tokenizer, mock_request
+    ):
+        request = self._request_with_weather(mock_request)
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=request.tools)
+        body = _invoke("get_weather", ("location", "true", "NYC"))
+        partial = (
+            _tool_calls(body).replace(DSML_INVOKE_END, "").replace(DSML_TOOL_END, "")
+        )
+
+        tentative = parser.extract_tool_calls_streaming(
+            "", partial, partial, [], [], [], request
+        )
+        closed = parser.extract_tool_calls_streaming(
+            partial, partial + DSML_INVOKE_END, DSML_INVOKE_END, [], [], [], request
+        )
+        aggregate = [delta for delta in (tentative, closed) if delta is not None]
+
+        assert tentative is None or not tentative.tool_calls
+        assert len(aggregate) == 1
+        tool_calls = aggregate[0].tool_calls
+        assert tool_calls[0].function.name == "get_weather"
+        arguments = "".join(
+            tc.function.arguments or "" for tc in tool_calls if tc.function is not None
+        )
+        assert json.loads(arguments) == {"location": "NYC"}
+        assert parser.finish_streaming() is None
+
+    def test_valid_parallel_sibling_survives_other_sibling_eos_invalidation(
+        self, mock_tokenizer, mock_request
+    ):
+        weather = _make_tool("get_weather", {"location": {"type": "string"}})
+        clock = _make_tool("get_time", {"zone": {"type": "string"}})
+        mock_request.tools = [weather, clock]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=mock_request.tools)
+        valid = _invoke("get_weather", ("location", "true", "NYC"))
+        incomplete = _invoke("get_time", ("zone", "true", "UTC")).replace(
+            DSML_INVOKE_END, ""
+        )
+        batch = DSML_TOOL_START + valid + incomplete
+
+        streamed = parser.extract_tool_calls_streaming(
+            "", batch, batch, [], [], [], mock_request
+        )
+        finished = parser.finish_streaming()
+        aggregate = [delta for delta in (streamed, finished) if delta is not None]
+        calls = [tc for delta in aggregate for tc in delta.tool_calls]
+
+        assert [call.function.name for call in calls] == [
+            "get_weather",
+            "__invalid_dsml_tool_call__",
+        ]
+        assert json.loads(calls[0].function.arguments) == {"location": "NYC"}
+        assert json.loads(calls[1].function.arguments)["tool_name"] == "get_time"
 
 
 class TestThinkingModeConfig:

@@ -1117,7 +1117,9 @@ def split_delta(delta: DeltaMessage) -> list[DeltaMessage]:
 
     The Responses API emits typed SSE events (one type per event), so a
     compound DeltaMessage must be split before entering the state machine.
-    Order: reasoning -> content -> tool_calls (grouped by index).
+    Field order is preserved for parser-produced terminal merges; ordinary
+    deltas use reasoning -> content -> tool_calls. Tool calls remain grouped
+    by index so one item can carry its name and arguments together.
     """
     has_reasoning = delta.reasoning is not None
     has_content = delta.content is not None
@@ -1131,16 +1133,22 @@ def split_delta(delta: DeltaMessage) -> list[DeltaMessage]:
         return [delta]
 
     deltas: list[DeltaMessage] = []
-    if has_reasoning:
-        deltas.append(DeltaMessage(reasoning=delta.reasoning))
-    if has_content:
-        deltas.append(DeltaMessage(content=delta.content))
-    if has_tools:
-        groups: dict[int | None, list[DeltaToolCall]] = {}
-        for tc in delta.tool_calls:
-            groups.setdefault(tc.index, []).append(tc)
-        for tcs in groups.values():
-            deltas.append(DeltaMessage(tool_calls=tcs))
+    field_order = getattr(delta, "_delta_order", None) or (
+        "reasoning",
+        "content",
+        "tool_calls",
+    )
+    for field_name in field_order:
+        if field_name == "reasoning" and has_reasoning:
+            deltas.append(DeltaMessage(reasoning=delta.reasoning))
+        elif field_name == "content" and has_content:
+            deltas.append(DeltaMessage(content=delta.content))
+        elif field_name == "tool_calls" and has_tools:
+            groups: dict[int | None, list[DeltaToolCall]] = {}
+            for tc in delta.tool_calls:
+                groups.setdefault(tc.index, []).append(tc)
+            for tcs in groups.values():
+                deltas.append(DeltaMessage(tool_calls=tcs))
     return deltas or [delta]
 
 

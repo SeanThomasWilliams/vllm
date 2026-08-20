@@ -329,6 +329,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),
+        skip_tool_parsing_preserve_terminals=frozenset({"PARAM_CLOSE"}),
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
         validate_tool_names=True,
@@ -358,6 +359,7 @@ class DeepSeekV4Parser(ParserEngine):
         self._arg_converter = self._convert_args
         self._pending_stray_tool_framing: str | None = None
         self._invalid_tool_names: set[str] = set()
+        self._tentative_tool_deltas: dict[int, list[DeltaToolCall]] = {}
         self._finish_invalid_slot: int | None = None
         self._finish_invalid_prefix: str | None = None
 
@@ -365,6 +367,7 @@ class DeepSeekV4Parser(ParserEngine):
         super()._reset(initial_state=initial_state)
         self._pending_stray_tool_framing = None
         self._invalid_tool_names.clear()
+        self._tentative_tool_deltas.clear()
         self._finish_invalid_slot = None
         self._finish_invalid_prefix = None
 
@@ -575,9 +578,46 @@ class DeepSeekV4Parser(ParserEngine):
         events: list[SemanticEvent],
         finished: bool = False,
     ) -> DeltaMessage | None:
+        explicit_closes = {
+            event.tool_index
+            for event in events
+            if event.type == EventType.TOOL_CALL_END
+        }
         delta = super()._events_to_delta(events, finished=finished)
         if self.skip_tool_parsing:
             return delta
+
+        if delta is not None and delta.tool_calls:
+            released: list[DeltaToolCall] = []
+            for tool_call in delta.tool_calls:
+                idx = tool_call.index
+                slot = self._tool_slots[idx]
+                if idx in explicit_closes:
+                    # The base engine has already applied the close.  A
+                    # malformed or unknown call is represented only by its
+                    # replacement sentinel; never release its tentative
+                    # requested name or arguments.
+                    if slot.invalid:
+                        self._tentative_tool_deltas.pop(idx, None)
+                    else:
+                        released.extend(self._tentative_tool_deltas.pop(idx, []))
+                    released.append(tool_call)
+                elif slot.invalid:
+                    # This is an auto-close generated while finishing a
+                    # partial call.  The invalid delta is the only safe
+                    # output for this slot.
+                    self._tentative_tool_deltas.pop(idx, None)
+                    released.append(tool_call)
+                else:
+                    self._tentative_tool_deltas.setdefault(idx, []).append(tool_call)
+
+            delta.tool_calls = released
+            if (
+                not delta.tool_calls
+                and delta.content is None
+                and delta.reasoning is None
+            ):
+                delta = None
 
         has_tool_calls = bool(delta is not None and delta.tool_calls)
         content = delta.content if delta is not None else None

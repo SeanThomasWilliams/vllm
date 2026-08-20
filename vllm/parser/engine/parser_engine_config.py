@@ -84,6 +84,12 @@ class ParserEngineConfig:
     # Special tokens exempt from auto-drop but not state-machine terminals.
     preserve_tokens: frozenset[str] = field(default_factory=frozenset)
 
+    # Terminals that remain visible when a parser adapter forwards the raw
+    # tool span instead of extracting it.
+    skip_tool_parsing_preserve_terminals: frozenset[str] = field(
+        default_factory=frozenset
+    )
+
     # Prevents trailing-whitespace accumulation across multi-turn conversations.
     strip_trailing_reasoning_whitespace: bool = True
 

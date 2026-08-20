@@ -1172,6 +1172,34 @@ class TestAutoToolStreaming:
 
     @pytest.mark.skip_global_cleanup
     @pytest.mark.asyncio
+    async def test_terminal_merge_preserves_tool_then_content_order(self, monkeypatch):
+        """A parser terminal merge must not make Responses reorder states."""
+        monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+
+        delta = DeltaMessage(
+            content="after the call",
+            tool_calls=[
+                DeltaToolCall(
+                    id="call_weather",
+                    type="function",
+                    index=0,
+                    function=DeltaFunctionCall(
+                        name="get_weather", arguments='{"location":"Berlin"}'
+                    ),
+                )
+            ],
+        )
+        delta._delta_order = ("tool_calls", "content")
+        events = await self._collect_events([delta])
+
+        types = [event.type for event in events]
+        argument_delta = types.index("response.function_call_arguments.delta")
+        text_delta = types.index("response.output_text.delta")
+        assert argument_delta < text_delta
+        assert types.index("response.output_item.done") < text_delta
+
+    @pytest.mark.skip_global_cleanup
+    @pytest.mark.asyncio
     async def test_compound_content_and_tool_name_args_same_delta(self, monkeypatch):
         monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
 

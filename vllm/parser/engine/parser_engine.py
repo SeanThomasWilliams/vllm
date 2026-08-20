@@ -225,11 +225,32 @@ class ParserEngine(Parser):
         tool_calls = first_tool_calls + second.tool_calls
         if len(tool_calls) > 1:
             tool_calls = self._coalesce_tool_call_deltas(tool_calls)
-        return DeltaMessage(
+        merged = DeltaMessage(
             content=(first.content or "") + (second.content or "") or None,
             reasoning=(first.reasoning or "") + (second.reasoning or "") or None,
             tool_calls=tool_calls,
         )
+
+        # Keep the order of fields that were merged across parser ticks. The
+        # Responses serving loop must split a compound delta without moving
+        # content ahead of a tool call that was already delivered.
+        default_order = ("reasoning", "content", "tool_calls")
+        field_order: list[str] = []
+        for delta in (first, second):
+            order = getattr(delta, "_delta_order", None) or default_order
+            for field in order:
+                present = (
+                    field == "reasoning"
+                    and delta.reasoning is not None
+                    or field == "content"
+                    and delta.content is not None
+                    or field == "tool_calls"
+                    and bool(delta.tool_calls)
+                )
+                if present and field not in field_order:
+                    field_order.append(field)
+        merged._delta_order = tuple(field_order)
+        return merged
 
     def _finish_streaming_delta(self) -> DeltaMessage | None:
         self._before_finish()
