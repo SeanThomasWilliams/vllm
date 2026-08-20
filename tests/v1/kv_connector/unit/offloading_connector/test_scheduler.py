@@ -113,8 +113,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -2090,25 +2090,44 @@ def test_reset_cache(request_runner, async_scheduling: bool):
         for group_state in req_status.group_states:
             assert group_state.next_stored_chunk_idx > 0
 
-    # Reset the cache
+    # Reset starts a worker-side barrier; the shared primary is not reset yet.
     runner.connector_scheduler.reset_cache()
-
-    # manager.reset_cache() must be called exactly once.
-    runner.manager.reset_cache.assert_called_once()
-
-    # In-flight load jobs must be queued for flushing to prevent CUDA stream
-    # races between old loads and new post-reset stores.
+    assert runner.connector_scheduler._reset_pending
+    runner.manager.reset_cache.assert_not_called()
     assert load_job_ids <= runner.connector_scheduler._current_batch_jobs_to_flush
 
-    # All internal job tracking must be cleared.
+    # The workers acknowledge the flush through the existing all-rank count.
+    reset_meta = runner.connector_scheduler.build_connector_meta(
+        SchedulerOutput.make_empty()
+    )
+    assert load_job_ids <= (reset_meta.jobs_to_flush or set())
+    runner.connector_scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in load_job_ids}
+            )
+        )
+    )
+
+    # Only the all-rank acknowledgement permits the primary reset and clears
+    # the scheduler state.
+    runner.manager.reset_cache.assert_called_once()
+    assert not runner.connector_scheduler._reset_pending
     assert not runner.connector_scheduler._jobs
     assert not runner.connector_scheduler._block_id_to_pending_jobs
     if runner.connector_scheduler._chunks_being_loaded is not None:
         assert not runner.connector_scheduler._chunks_being_loaded
 
-    # Job reset counter must equal the job counter so that completions for
-    # pre-reset jobs arriving from workers are silently discarded.
+    # Job reset counter must equal the job counter so that duplicate or late
+    # completions for pre-reset jobs are safely discarded.
     assert runner.connector_scheduler._stale_job_threshold == job_counter_before_reset
+    runner.connector_scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in load_job_ids}
+            )
+        )
+    )
 
     # next_stored_chunk_idx must be reset to 0 for every active request so
     # that post-reset stores restart from block 0.
@@ -2165,9 +2184,20 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert finalized == []
     assert req_id in cs._req_status
 
-    # reset_cache discards both the in-flight and not-yet-prepared final stores,
-    # so it issues the deferred notification before dropping the state.
+    # reset_cache waits for the worker-side acknowledgement before discarding
+    # the in-flight store and issuing the deferred notification.
+    pending_job_ids = set(cs._jobs)
     cs.reset_cache()
+    assert finalized == []
+    reset_meta = cs.build_connector_meta(SchedulerOutput.make_empty())
+    assert pending_job_ids <= (reset_meta.jobs_to_flush or set())
+    cs.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in pending_job_ids}
+            )
+        )
+    )
     assert finalized == [req_id]
     assert req_id not in cs._req_status
 

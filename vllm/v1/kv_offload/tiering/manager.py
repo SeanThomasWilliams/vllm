@@ -361,6 +361,7 @@ class TieringOffloadingManager(OffloadingManager):
     def _discard_idle_primary_blocks(self) -> None:
         removed = self.primary_tier.discard_ready(self._pending_primary_discards)
         self._pending_primary_discards.difference_update(removed)
+        self._discard_orphaned_promotions()
 
     def _discard_loaded_promotions(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -371,10 +372,13 @@ class TieringOffloadingManager(OffloadingManager):
             candidates.update(owned.intersection(keys))
         removed = self.primary_tier.discard_ready(candidates)
         self._orphaned_promoted_discards.difference_update(removed)
+        blocked = candidates.difference(removed)
         if owned is not None:
             owned.difference_update(removed)
+            owned.difference_update(blocked)
             if not owned:
                 self._promoted_discards_by_req.pop(req_context.req_id, None)
+        self._orphaned_promoted_discards.update(blocked)
 
     def _discard_orphaned_promotions(
         self, keys: Collection[OffloadKey] | None = None
@@ -427,25 +431,38 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> dict[JobId, WorkerTransferSpec]:
         jobs: dict[JobId, WorkerTransferSpec] = {}
         for pending in self._pending_worker_transfers:
-            job_id = self._reserve_worker_job_id(allocate_job_id)
-            job = TransferJob(
-                job_id=job_id,
-                keys=pending.keys,
-                block_ids=pending.block_ids,
-                is_promotion=pending.is_promotion,
-                req_context=pending.req_context,
-            )
             if pending.is_promotion:
-                src_spec, dst_spec = pending.tier.build_worker_load_transfer(job)
+                if len(pending.keys) != len(pending.block_ids):
+                    raise ValueError(
+                        "Worker promotion keys and block_ids must have equal lengths"
+                    )
+                pending_jobs = (
+                    (key, np.asarray([block_id], dtype=np.int64))
+                    for key, block_id in zip(pending.keys, pending.block_ids)
+                )
             else:
-                src_spec, dst_spec = pending.tier.build_worker_store_transfer(job)
-            self._worker_transfer_jobs[job_id] = (pending.tier, job)
-            jobs[job_id] = WorkerTransferSpec(
-                req_id=pending.req_context.req_id,
-                src_spec=src_spec,
-                dst_spec=dst_spec,
-                operation="load" if pending.is_promotion else "store",
-            )
+                pending_jobs = ((pending.keys, pending.block_ids),)
+
+            for keys, block_ids in pending_jobs:
+                job_id = self._reserve_worker_job_id(allocate_job_id)
+                job = TransferJob(
+                    job_id=job_id,
+                    keys=(keys,) if pending.is_promotion else keys,
+                    block_ids=block_ids,
+                    is_promotion=pending.is_promotion,
+                    req_context=pending.req_context,
+                )
+                if pending.is_promotion:
+                    src_spec, dst_spec = pending.tier.build_worker_load_transfer(job)
+                else:
+                    src_spec, dst_spec = pending.tier.build_worker_store_transfer(job)
+                self._worker_transfer_jobs[job_id] = (pending.tier, job)
+                jobs[job_id] = WorkerTransferSpec(
+                    req_id=pending.req_context.req_id,
+                    src_spec=src_spec,
+                    dst_spec=dst_spec,
+                    operation="load" if pending.is_promotion else "store",
+                )
         self._pending_worker_transfers.clear()
         for tier in self.secondary_tiers:
             pop_lookup_jobs = getattr(tier, "pop_worker_lookup_jobs", None)
@@ -1110,11 +1127,13 @@ class TieringOffloadingManager(OffloadingManager):
     def reset_cache(self) -> None:
         """Reset transfer bookkeeping and primary-tier cache.
 
-        Called during sleep, weight update, or resume. Each secondary tier
-        drains its in-flight transfers via drain_jobs() so no tier I/O is
-        touching primary memory before the primary tier is reset. A stuck
-        tier will block here visibly — preferable to silent corruption
-        from reusing primary slots while a transfer is mid-copy.
+        Called during sleep, weight update, or resume. The offloading scheduler
+        completes its all-worker flush barrier before calling this method when
+        worker transfers are enabled. Each secondary tier then drains its
+        scheduler-side transfers, so no tier I/O is touching primary memory
+        before the primary tier is reset. A stuck tier will block here visibly
+        — preferable to silent corruption from reusing primary slots while a
+        transfer is mid-copy.
 
         Secondary tiers are intentionally not reset: persistent stores
         (FS, network) keep their data across resets. Active request state is

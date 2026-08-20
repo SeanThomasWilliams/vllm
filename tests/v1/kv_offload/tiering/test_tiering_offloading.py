@@ -14,6 +14,7 @@ These tests verify:
 from collections.abc import Iterable
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -51,6 +52,7 @@ from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManag
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
+    PendingWorkerTransfer,
     TieringOffloadingManager,
 )
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
@@ -265,6 +267,9 @@ class WorkerControlSecondaryTierManager(MetricsSecondaryTierManager):
     def build_worker_store_transfer(self, job_metadata: TransferJob):
         return LoadStoreSpec(), LoadStoreSpec()
 
+    def build_worker_load_transfer(self, job_metadata: TransferJob):
+        return LoadStoreSpec(), LoadStoreSpec()
+
     def _control(self, job_metadata: TransferJob, action: str):
         self.control_actions.append(action)
         spec = LoadStoreSpec()
@@ -286,6 +291,73 @@ class WorkerControlSecondaryTierManager(MetricsSecondaryTierManager):
 
     def complete_worker_store(self, job_metadata, success):
         self.completed_worker_stores.append(success)
+
+
+def test_worker_promotions_are_one_job_per_key():
+    """Worker promotion failures cannot invalidate a sibling key."""
+    mock_region = _mock_mmap_region(4)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=4, mmap_region=mock_region
+    )
+    secondary_tier = WorkerControlSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="worker",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary_tier, secondary_tiers=[secondary_tier]
+    )
+    keys = to_keys([1, 2])
+    manager._pending_worker_transfers.append(
+        PendingWorkerTransfer(
+            tier=secondary_tier,
+            keys=keys,
+            block_ids=np.asarray([0, 1], dtype=np.int64),
+            is_promotion=True,
+            req_context=_CTX,
+        )
+    )
+    try:
+        next_job_id = iter([10, 11]).__next__
+        jobs = manager.pop_worker_transfer_jobs(next_job_id)
+        assert list(jobs) == [10, 11]
+        assert [manager._worker_transfer_jobs[job_id][1].keys for job_id in jobs] == [
+            (keys[0],),
+            (keys[1],),
+        ]
+    finally:
+        manager.shutdown()
+
+
+def test_retain_primary_false_retries_blocked_promoted_discard():
+    """A later reader release retries a promotion owned by an earlier reader."""
+    mock_region = _mock_mmap_region(2)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=2, mmap_region=mock_region
+    )
+    secondary_tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="secondary",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary_tier,
+        secondary_tiers=[secondary_tier],
+        retain_primary_cache=False,
+    )
+    promoted_key = to_keys([1])[0]
+    primary_tier.complete_load = MagicMock()
+    primary_tier.discard_ready = MagicMock(
+        side_effect=[set(), set(), set(), {promoted_key}, set(), set()]
+    )
+    manager._promoted_discards_by_req["owner"] = {promoted_key}
+    try:
+        manager.complete_load([promoted_key], ReqContext(req_id="owner"))
+        manager.complete_load([promoted_key], ReqContext(req_id="reader"))
+        assert promoted_key not in manager._orphaned_promoted_discards
+        assert primary_tier.discard_ready.call_count == 6
+    finally:
+        manager.shutdown()
 
 
 def test_worker_store_commit_release_finalize_and_abort():

@@ -629,6 +629,11 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
         self._pending_worker_control_jobs: dict[int, TransferJob] = {}
+        # Reset is completed only after workers acknowledge every old job. The
+        # IDs remain tracked so a control phase spawned by a store is included
+        # in the same barrier.
+        self._reset_pending = False
+        self._reset_job_ids: set[int] = set()
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -1569,10 +1574,25 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _build_reset_metadata(self) -> KVConnectorMetadata:
+        """Keep delivering the worker-side reset barrier until it drains."""
+        self._current_batch_jobs_to_flush.update(self._reset_job_ids)
+        worker_transfer_jobs = self._pending_worker_control_jobs
+        self._pending_worker_control_jobs = {}
+        return OffloadingConnectorMetadata(
+            load_jobs={},
+            store_jobs={},
+            worker_transfer_jobs=worker_transfer_jobs,
+            jobs_to_flush=set(self._current_batch_jobs_to_flush),
+        )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
+        if self._reset_pending:
+            return self._build_reset_metadata()
+
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
@@ -1656,7 +1676,9 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            self._reset_pending or bool(self._jobs) or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1709,7 +1731,10 @@ class OffloadingConnectorScheduler:
                     self._stale_job_threshold,
                 )
                 continue
-            job_status = self._jobs[job_id]
+            job_status = self._jobs.get(job_id)
+            if job_status is None:
+                logger.debug("Skipping unknown completed job %d", job_id)
+                continue
             job_status.pending_count -= count
             job_status.failed_count += meta.failed_jobs.get(job_id, 0)
             if job_status.pending_count > 0:
@@ -1721,6 +1746,7 @@ class OffloadingConnectorScheduler:
                 if job_status.worker_operation == "lookup":
                     self.manager.complete_worker_lookup(job_id, success)
                     del self._jobs[job_id]
+                    self._reset_job_ids.discard(job_id)
                     continue
                 if job_status.worker_operation in {
                     "commit",
@@ -1743,9 +1769,15 @@ class OffloadingConnectorScheduler:
                     )
                     continue
                 del self._jobs[job_id]
+                self._reset_job_ids.discard(job_id)
                 continue
 
-            req_status = self._req_status[job_status.req_id]
+            req_status = self._req_status.get(job_status.req_id)
+            if req_status is None:
+                logger.debug("Skipping completed job %d for unknown request", job_id)
+                del self._jobs[job_id]
+                self._reset_job_ids.discard(job_id)
+                continue
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
@@ -1764,9 +1796,12 @@ class OffloadingConnectorScheduler:
                     )
 
             del self._jobs[job_id]
-            req_status.transfer_jobs.remove(job_id)
+            self._reset_job_ids.discard(job_id)
+            req_status.transfer_jobs.discard(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
+
+        self._maybe_finish_reset()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -1837,24 +1872,20 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
-    def reset_cache(self) -> None:
-        """Reset the offloading manager cache, evicting all stored chunks."""
+    def _maybe_finish_reset(self) -> None:
+        if not self._reset_pending or self._reset_job_ids:
+            return
+        if self._pending_worker_control_jobs:
+            return
 
-        # reset_cache cannot be called in the middle of a schedule step
-        assert not self._current_batch_load_jobs
-        assert not self._current_batch_jobs_to_flush
-        assert not self._current_batch_allocated_block_ids
-
-        # Flush all in-flight jobs
-        self._current_batch_jobs_to_flush.update(self._jobs.keys())
-
+        # Every worker has reported the final phase of every old job. Only now
+        # may the manager reset the shared primary mmap.
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
 
-        # Reset offloading manager cache
         self.manager.reset_cache()
 
         # Reset store progress so active requests re-offload from chunk 0.
@@ -1864,20 +1895,32 @@ class OffloadingConnectorScheduler:
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
 
-        # Discard jobs and save job_counter to be able to discard worker responses
+        # Discard jobs and save job_counter to be able to discard duplicate or
+        # delayed worker responses from before this reset.
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._pending_worker_control_jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._current_batch_jobs_to_flush.clear()
 
-        # The manager pool is empty; pending event payloads and announced
-        # reference counts are stale.
         self._events_tracker.reset()
-
-        # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
-        # The load flush IDs collected above must be delivered to workers.
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
+        self._reset_pending = False
+
+    def reset_cache(self) -> None:
+        """Reset only after the worker-side all-rank flush barrier completes."""
+
+        # reset_cache cannot be called in the middle of a schedule step
+        assert not self._current_batch_load_jobs
+        assert not self._current_batch_jobs_to_flush
+        assert not self._current_batch_allocated_block_ids
+        assert not self._reset_pending
+
+        self._reset_pending = True
+        self._reset_job_ids = set(self._jobs)
+        self._current_batch_jobs_to_flush.update(self._reset_job_ids)
+        self._maybe_finish_reset()
 
     def shutdown(self) -> None:
         self.manager.shutdown()
