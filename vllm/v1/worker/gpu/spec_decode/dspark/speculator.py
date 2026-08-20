@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import json
 from typing import Any
 
 import torch
@@ -42,6 +43,9 @@ from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
+
+_DSPARK_PROPOSAL_TRACE_EMITTED = False
+_DSPARK_PROPOSAL_TRACE_K = 5
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -85,6 +89,20 @@ class DSparkSpeculator(DFlashSpeculator):
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
+
+        self._proposal_trace_enabled = bool(
+            envs.VLLM_DSPARK_PROPOSAL_TRACE
+            and self.num_speculative_steps == _DSPARK_PROPOSAL_TRACE_K
+        )
+        if self._proposal_trace_enabled:
+            self._proposal_trace_raw_ids = torch.empty(
+                self.num_speculative_steps, dtype=torch.int64, device=device
+            )
+            self._proposal_trace_prefix_bits = torch.empty(
+                self.num_speculative_steps, dtype=torch.int32, device=device
+            )
+        self._proposal_trace_pending = False
+        self._proposal_trace_steps = 0
 
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
@@ -173,6 +191,60 @@ class DSparkSpeculator(DFlashSpeculator):
             self.calibrated_confidence_logits = torch.zeros_like(
                 self.draft_token_confidence_logits
             )
+
+    def _emit_proposal_trace(self) -> None:
+        """Emit the one-shot trace after replay, never from a captured stream.
+
+        The process-local latch is consumed before payload construction and
+        logging so any host-read or logger failure fails closed rather than
+        retrying the diagnostic on a later proposal.
+        """
+        global _DSPARK_PROPOSAL_TRACE_EMITTED
+
+        if (
+            not self._proposal_trace_enabled
+            or not self._proposal_trace_pending
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        if _DSPARK_PROPOSAL_TRACE_EMITTED:
+            self._proposal_trace_pending = False
+            return
+
+        steps = self._proposal_trace_steps
+        if (
+            steps != _DSPARK_PROPOSAL_TRACE_K
+            or self.num_speculative_steps != _DSPARK_PROPOSAL_TRACE_K
+        ):
+            self._proposal_trace_pending = False
+            return
+
+        _DSPARK_PROPOSAL_TRACE_EMITTED = True
+        self._proposal_trace_pending = False
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        payload = {
+            "rank": rank,
+            "K": int(steps),
+            "markov_outside_cudagraph": int(self._markov_outside_cudagraph),
+            "capture_sharded_markov": int(self._capture_sharded_markov),
+            "local_draft_argmax": int(self._use_local_draft_argmax),
+            "draft_topk": -1 if self._draft_topk is None else int(self._draft_topk),
+            "raw_ids": self._proposal_trace_raw_ids[:steps].detach().cpu().tolist(),
+            "prefix_bits": self._proposal_trace_prefix_bits[:steps]
+            .detach()
+            .cpu()
+            .tolist(),
+            "masked_ids": self.draft_tokens[0, :steps].detach().cpu().tolist(),
+            "valid_length": int(self.draft_token_valid_lengths[0].item()),
+            "capacity": int(self.draft_token_capacity[0].item()),
+        }
+        logger.info(
+            "DSpark proposal trace %s", json.dumps(payload, separators=(",", ":"))
+        )
 
     def load_draft_model(
         self,
@@ -369,6 +441,14 @@ class DSparkSpeculator(DFlashSpeculator):
         confidence_logits = self.draft_token_confidence_logits[:num_reqs, :n_spec]
         min_survival_probability = self.min_survival_probability
         use_confidence_capacity = self.use_draft_token_capacity and use_capacity
+        trace_raw_ids = (
+            self._proposal_trace_raw_ids[:n_spec]
+            if getattr(self, "_proposal_trace_enabled", False)
+            and n_spec == _DSPARK_PROPOSAL_TRACE_K
+            else None
+        )
+        if trace_raw_ids is not None:
+            self._proposal_trace_steps = n_spec
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # laid out as one row per request in the draft query block.
@@ -422,9 +502,13 @@ class DSparkSpeculator(DFlashSpeculator):
                 draft_sampled_i = self._sample_logits(
                     logits_i, idx_map[:, i], sample_pos[:, i], i
                 )
+            if trace_raw_ids is not None:
+                trace_raw_ids[i].copy_(draft_sampled_i[0])
             valid_prefix.logical_and_(
                 (draft_sampled_i >= 0) & (draft_sampled_i < self.vocab_size)
             )
+            if trace_raw_ids is not None:
+                self._proposal_trace_prefix_bits[i].copy_(valid_prefix[0])
             draft_sampled_i = torch.where(
                 valid_prefix, draft_sampled_i, torch.zeros_like(draft_sampled_i)
             )
@@ -523,27 +607,50 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> torch.Tensor:
         if self.use_draft_token_capacity:
             self._runtime_num_reqs_for_capacity.fill_(input_batch.num_reqs)
+
+        is_profile = bool(kwargs.get("is_profile", False))
+        dummy_run = bool(kwargs.get("dummy_run", False))
+        active_num_speculative_steps = (
+            num_speculative_tokens
+            if self.dynamic_physical_depth and num_speculative_tokens is not None
+            else self.num_speculative_steps
+        )
+        self._last_num_speculative_steps = active_num_speculative_steps
+
+        has_unaligned_cached_prefix = False
+        if (
+            (self.use_draft_token_capacity or self._proposal_trace_enabled)
+            and not is_profile
+            and not dummy_run
+        ):
+            has_unaligned_cached_prefix = self._has_unaligned_cached_prefix(input_batch)
+
+        self._proposal_trace_pending = bool(
+            self._proposal_trace_enabled
+            and active_num_speculative_steps == _DSPARK_PROPOSAL_TRACE_K
+            and not is_profile
+            and not dummy_run
+            and not has_unaligned_cached_prefix
+        )
         self._last_proposal_confidence_valid = bool(
             self.use_draft_token_capacity
-            and not kwargs.get("is_profile", False)
-            and not kwargs.get("dummy_run", False)
-            and not self._has_unaligned_cached_prefix(input_batch)
+            and not is_profile
+            and not dummy_run
+            and not has_unaligned_cached_prefix
             and (
                 self.capacity_activation_batch_size <= 0
                 or input_batch.num_reqs >= self.capacity_activation_batch_size
             )
         )
-        self._last_num_speculative_steps = (
-            num_speculative_tokens
-            if self.dynamic_physical_depth and num_speculative_tokens is not None
-            else self.num_speculative_steps
-        )
-        return super().propose(
+        draft_tokens = super().propose(
             input_batch,
             *args,
             num_speculative_tokens=num_speculative_tokens,
             **kwargs,
         )
+        if self._proposal_trace_pending:
+            self._emit_proposal_trace()
+        return draft_tokens
 
     def _generate_draft(
         self,
