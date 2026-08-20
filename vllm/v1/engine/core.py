@@ -819,8 +819,8 @@ class EngineCore:
             type(self) is EngineCore
             and not reset_successful
             and reset_connector
-            and self.scheduler.connector is not None
-            and self.scheduler.connector.has_pending_push_work()
+            and (kv_connector := self.scheduler.get_kv_connector()) is not None
+            and kv_connector.has_pending_push_work()
         ):
             # A failed local reset with user work still present must return
             # immediately: stepping here would execute user model work. Once

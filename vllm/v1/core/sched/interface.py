@@ -221,6 +221,10 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def reset_connector_cache(self) -> bool:
+        """Reset the KV connector cache and report whether it completed."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

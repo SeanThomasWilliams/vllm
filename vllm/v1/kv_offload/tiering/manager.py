@@ -431,13 +431,14 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> dict[JobId, WorkerTransferSpec]:
         jobs: dict[JobId, WorkerTransferSpec] = {}
         for pending in self._pending_worker_transfers:
+            pending_jobs: Iterable[tuple[Collection[OffloadKey], np.ndarray]]
             if pending.is_promotion:
                 if len(pending.keys) != len(pending.block_ids):
                     raise ValueError(
                         "Worker promotion keys and block_ids must have equal lengths"
                     )
                 pending_jobs = (
-                    (key, np.asarray([block_id], dtype=np.int64))
+                    ((key,), np.asarray([block_id], dtype=np.int64))
                     for key, block_id in zip(pending.keys, pending.block_ids)
                 )
             else:
@@ -447,7 +448,7 @@ class TieringOffloadingManager(OffloadingManager):
                 job_id = self._reserve_worker_job_id(allocate_job_id)
                 job = TransferJob(
                     job_id=job_id,
-                    keys=(keys,) if pending.is_promotion else keys,
+                    keys=keys,
                     block_ids=block_ids,
                     is_promotion=pending.is_promotion,
                     req_context=pending.req_context,
