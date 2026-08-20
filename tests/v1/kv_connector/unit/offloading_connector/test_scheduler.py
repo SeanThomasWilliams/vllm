@@ -22,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    TransferJob as WorkerTransferJob,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
@@ -1863,6 +1866,9 @@ def test_worker_transfer_failure_is_aggregated_across_all_ranks():
     }
     scheduler._stale_job_threshold = 0
     scheduler._connector_stats = OffloadingConnectorStats()
+    scheduler._reset_pending = False
+    scheduler._reset_job_ids = set()
+    scheduler._pending_worker_control_jobs = {}
     scheduler.manager = MagicMock()
     scheduler.manager.complete_worker_transfer.return_value = None
     scheduler.config = SimpleNamespace(num_workers=3)
@@ -1890,6 +1896,58 @@ def test_worker_transfer_failure_is_aggregated_across_all_ranks():
         )
     )
     scheduler.manager.complete_worker_transfer.assert_called_once_with(42, False)
+    assert 42 not in scheduler._jobs
+
+
+def test_reset_barrier_keeps_same_job_through_worker_control():
+    """Reset waits through transfer and all-rank control ACKs on one job ID."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._jobs = {
+        42: TransferJobStatus(
+            req_id="req",
+            pending_count=3,
+            keys=set(),
+            is_store=False,
+            is_worker_transfer=True,
+            worker_operation="transfer",
+        )
+    }
+    scheduler._stale_job_threshold = 0
+    scheduler._connector_stats = OffloadingConnectorStats()
+    scheduler._reset_pending = False
+    scheduler._reset_job_ids = set()
+    scheduler._pending_worker_control_jobs = {}
+    scheduler._current_batch_load_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._current_batch_allocated_block_ids = set()
+    scheduler._block_id_to_pending_jobs = {}
+    scheduler._req_status = {}
+    scheduler._chunks_being_loaded = None
+    scheduler._events_tracker = MagicMock()
+    scheduler.manager = MagicMock()
+    scheduler.config = SimpleNamespace(num_workers=3)
+    control = WorkerTransferJob(
+        req_id="req", src_spec=MagicMock(), dst_spec=MagicMock(), operation="commit"
+    )
+    scheduler.manager.complete_worker_transfer.return_value = control
+    scheduler.manager.complete_worker_control.return_value = None
+
+    assert scheduler.reset_cache() is False
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={42: 3})
+        )
+    )
+    assert scheduler._jobs[42].pending_count == 3
+    assert scheduler._jobs[42].worker_operation == "commit"
+    assert not scheduler.manager.reset_cache.called
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={42: 3})
+        )
+    )
+    assert scheduler.manager.reset_cache.call_count == 1
     assert 42 not in scheduler._jobs
 
 
@@ -2207,6 +2265,26 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_id not in cs._req_status
 
 
+def test_engine_core_reset_waits_for_connector_barrier():
+    """Core cache clearing does not succeed before a deferred connector reset."""
+    from vllm.v1.engine.core import EngineCore
+
+    core = object.__new__(EngineCore)
+    core.scheduler = MagicMock()
+    core.scheduler.reset_prefix_cache.side_effect = [False, True]
+    core.reset_mm_cache = MagicMock()
+    core.reset_encoder_cache = MagicMock()
+
+    assert core._reset_caches() is False
+    core.reset_mm_cache.assert_not_called()
+    core.reset_encoder_cache.assert_not_called()
+
+    assert core._reset_caches() is True
+    core.reset_mm_cache.assert_called_once_with()
+    core.reset_encoder_cache.assert_called_once_with()
+    assert core.scheduler.reset_prefix_cache.call_count == 2
+
+
 def test_pending_transfer_defers_prefix_lookup():
     """A request with an in-flight store must not issue a load on re-admission.
 
@@ -2226,6 +2304,8 @@ def test_pending_transfer_defers_prefix_lookup():
         transfer_jobs={123},
     )
     scheduler._req_status = {request.request_id: req_status}
+    scheduler._reset_pending = False
+    scheduler._reset_job_ids = set()
 
     matched_tokens, is_async = scheduler.get_num_new_matched_tokens(
         request,
