@@ -2153,11 +2153,8 @@ def test_reset_cache(request_runner, async_scheduling: bool):
             assert group_state.next_stored_chunk_idx > 0
 
     # Reset starts a worker-side barrier; the shared primary is not reset yet.
-    assert runner.connector_scheduler.reset_cache() is False
+    runner.connector_scheduler.reset_cache()
     assert runner.connector_scheduler._reset_pending
-    # Repeated reset requests join the same barrier rather than asserting or
-    # starting a second reset epoch.
-    assert runner.connector_scheduler.reset_cache() is False
     runner.manager.reset_cache.assert_not_called()
     assert load_job_ids <= runner.connector_scheduler._current_batch_jobs_to_flush
 
@@ -2166,8 +2163,6 @@ def test_reset_cache(request_runner, async_scheduling: bool):
         SchedulerOutput.make_empty()
     )
     assert load_job_ids <= (reset_meta.jobs_to_flush or set())
-    assert reset_meta.load_jobs == {}
-    assert runner.connector_scheduler._current_batch_load_jobs == {}
     runner.connector_scheduler.update_connector_output(
         KVConnectorOutput(
             kv_connector_worker_meta=OffloadingWorkerMetadata(

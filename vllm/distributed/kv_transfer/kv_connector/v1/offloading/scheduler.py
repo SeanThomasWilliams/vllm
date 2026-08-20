@@ -1594,10 +1594,6 @@ class OffloadingConnectorScheduler:
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
         if self._reset_pending:
-            # A request may still be admitted while the engine drains the
-            # barrier. Never retain a load targeting a pre-reset destination.
-            self._current_batch_load_jobs.clear()
-            self._current_batch_allocated_block_ids.clear()
             return self._build_reset_metadata()
 
         schedule_end_context = ScheduleEndContext(
@@ -1908,32 +1904,26 @@ class OffloadingConnectorScheduler:
         self._jobs.clear()
         self._pending_worker_control_jobs.clear()
         self._block_id_to_pending_jobs.clear()
-        self._current_batch_load_jobs.clear()
         self._current_batch_jobs_to_flush.clear()
-        self._current_batch_allocated_block_ids.clear()
 
         self._events_tracker.reset()
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
         self._reset_pending = False
 
-    def reset_cache(self) -> bool:
+    def reset_cache(self) -> None:
         """Reset only after the worker-side all-rank flush barrier completes."""
-
-        if self._reset_pending:
-            self._maybe_finish_reset()
-            return not self._reset_pending
 
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
         assert not self._current_batch_jobs_to_flush
         assert not self._current_batch_allocated_block_ids
+        assert not self._reset_pending
 
         self._reset_pending = True
         self._reset_job_ids = set(self._jobs)
         self._current_batch_jobs_to_flush.update(self._reset_job_ids)
         self._maybe_finish_reset()
-        return not self._reset_pending
 
     def shutdown(self) -> None:
         self.manager.shutdown()
