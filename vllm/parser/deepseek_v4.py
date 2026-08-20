@@ -592,47 +592,43 @@ class DeepSeekV4Parser(ParserEngine):
 
         if explicit_closes or (delta is not None and delta.tool_calls):
             released: list[DeltaToolCall] = []
-            handled_closes: set[int] = set()
             current_tool_calls = delta.tool_calls if delta is not None else []
+            current_by_idx: dict[int, list[DeltaToolCall]] = {}
             for tool_call in current_tool_calls:
-                idx = tool_call.index
+                current_by_idx.setdefault(tool_call.index, []).append(tool_call)
+
+            # Release every closed slot in event order. Current deltas are
+            # grouped first so a close-only slot cannot be overtaken by a
+            # later sibling whose final fragment arrived in this batch.
+            for idx in explicit_close_order:
+                if idx < 0 or idx >= len(self._tool_slots):
+                    continue
                 slot = self._tool_slots[idx]
-                if idx in explicit_closes:
-                    # The base engine has already applied the close. A
-                    # malformed or unknown call is represented only by its
-                    # replacement sentinel; never release its tentative
-                    # requested name or arguments.
-                    if idx not in handled_closes:
-                        if slot.invalid:
-                            self._tentative_tool_deltas.pop(idx, None)
-                        else:
-                            released.extend(self._tentative_tool_deltas.pop(idx, []))
-                        handled_closes.add(idx)
-                    released.append(tool_call)
+                current = current_by_idx.pop(idx, [])
+                if slot.invalid:
+                    self._tentative_tool_deltas.pop(idx, None)
+                else:
+                    released.extend(self._tentative_tool_deltas.pop(idx, []))
+                if current:
+                    released.extend(current)
                 elif slot.invalid:
-                    # This is an auto-close generated while finishing a
-                    # partial call. The invalid delta is the only safe
-                    # output for this slot.
+                    released.append(self._make_invalid_tool_delta(idx))
+
+            # Non-closed current deltas are still tentative, except for an
+            # invalid auto-close which is already safe to expose.
+            for tool_call in current_tool_calls:
+                if tool_call.index not in current_by_idx:
+                    continue
+                idx = tool_call.index
+                current_by_idx[idx].remove(tool_call)
+                if not current_by_idx[idx]:
+                    del current_by_idx[idx]
+                slot = self._tool_slots[idx]
+                if slot.invalid:
                     self._tentative_tool_deltas.pop(idx, None)
                     released.append(tool_call)
                 else:
                     self._tentative_tool_deltas.setdefault(idx, []).append(tool_call)
-
-            # A close can be semantically complete even when the base
-            # converter has no final fragment to append. Release every
-            # independently closed slot, not just slots represented by a
-            # current DeltaToolCall.
-            for idx in explicit_close_order:
-                if idx in handled_closes:
-                    continue
-                if idx < 0 or idx >= len(self._tool_slots):
-                    continue
-                slot = self._tool_slots[idx]
-                if slot.invalid:
-                    self._tentative_tool_deltas.pop(idx, None)
-                    released.append(self._make_invalid_tool_delta(idx))
-                else:
-                    released.extend(self._tentative_tool_deltas.pop(idx, []))
 
             if delta is None and released:
                 from vllm.entrypoints.openai.engine.protocol import DeltaMessage

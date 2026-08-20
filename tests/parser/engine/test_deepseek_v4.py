@@ -515,6 +515,48 @@ class TestTentativeToolStreaming:
         assert delta.tool_calls == buffered
         assert delta.tool_calls[0].function.name == "get_weather"
 
+    def test_parallel_close_order_interleaves_buffered_and_current_slots(
+        self, mock_tokenizer, mock_request
+    ):
+        weather = _make_tool("get_weather", {"location": {"type": "string"}})
+        clock = _make_tool("get_time", {"zone": {"type": "string"}})
+        mock_request.tools = [weather, clock]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=mock_request.tools)
+
+        first = [
+            SemanticEvent(EventType.TOOL_CALL_START, tool_index=0),
+            SemanticEvent(EventType.TOOL_NAME, "get_weather", tool_index=0),
+            SemanticEvent(
+                EventType.ARG_VALUE_CHUNK,
+                _param("location", "true", "NYC"),
+                tool_index=0,
+            ),
+        ]
+        assert parser._events_to_delta(first) is None
+        parser._tool_slots[0].streamed_json = parser._convert_args_for_slot(0, False)
+
+        delta = parser._events_to_delta(
+            [
+                SemanticEvent(EventType.TOOL_CALL_END, tool_index=0),
+                SemanticEvent(EventType.TOOL_CALL_START, tool_index=1),
+                SemanticEvent(EventType.TOOL_NAME, "get_time", tool_index=1),
+                SemanticEvent(
+                    EventType.ARG_VALUE_CHUNK,
+                    _param("zone", "true", "UTC"),
+                    tool_index=1,
+                ),
+                SemanticEvent(EventType.TOOL_CALL_END, tool_index=1),
+            ]
+        )
+
+        assert delta is not None
+        names = [
+            tool_call.function.name
+            for tool_call in delta.tool_calls
+            if tool_call.function is not None and tool_call.function.name
+        ]
+        assert names == ["get_weather", "get_time"]
+
     def test_valid_parallel_sibling_survives_other_sibling_eos_invalidation(
         self, mock_tokenizer, mock_request
     ):
