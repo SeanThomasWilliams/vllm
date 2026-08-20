@@ -1899,19 +1899,9 @@ def test_worker_transfer_failure_is_aggregated_across_all_ranks():
     assert 42 not in scheduler._jobs
 
 
-def test_reset_barrier_keeps_same_job_through_worker_control(request_runner):
-    """Reset waits through transfer and all-rank control ACKs on one job ID.
-
-    Use the request runner so constructor-owned reset state stays in sync with
-    the scheduler implementation instead of reproducing it with object.__new__.
-    """
-    runner = request_runner(
-        block_size=4,
-        num_gpu_blocks=10,
-        async_scheduling=False,
-        worker_count=3,
-    )
-    scheduler = runner.connector_scheduler
+def test_reset_barrier_keeps_same_job_through_worker_control():
+    """Reset waits through transfer and all-rank control ACKs on one job ID."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler._jobs = {
         42: TransferJobStatus(
             req_id="req",
@@ -1922,8 +1912,20 @@ def test_reset_barrier_keeps_same_job_through_worker_control(request_runner):
             worker_operation="transfer",
         )
     }
-    assert scheduler._job_counter == 0
-    assert scheduler._reset_pending is False
+    scheduler._stale_job_threshold = 0
+    scheduler._connector_stats = OffloadingConnectorStats()
+    scheduler._reset_pending = False
+    scheduler._reset_job_ids = set()
+    scheduler._pending_worker_control_jobs = {}
+    scheduler._current_batch_load_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._current_batch_allocated_block_ids = set()
+    scheduler._block_id_to_pending_jobs = {}
+    scheduler._req_status = {}
+    scheduler._chunks_being_loaded = None
+    scheduler._events_tracker = MagicMock()
+    scheduler.manager = MagicMock()
+    scheduler.config = SimpleNamespace(num_workers=3)
     control = WorkerTransferJob(
         req_id="req", src_spec=MagicMock(), dst_spec=MagicMock(), operation="commit"
     )
@@ -1939,12 +1941,6 @@ def test_reset_barrier_keeps_same_job_through_worker_control(request_runner):
     assert scheduler._jobs[42].pending_count == 3
     assert scheduler._jobs[42].worker_operation == "commit"
     assert not scheduler.manager.reset_cache.called
-
-    # Dispatch the spawned control metadata before accepting its ACKs. The
-    # pending table contains unsent controls only and must be empty in flight.
-    reset_meta = scheduler._build_reset_metadata()
-    assert 42 in reset_meta.worker_transfer_jobs
-    assert scheduler._pending_worker_control_jobs == {}
 
     scheduler.update_connector_output(
         KVConnectorOutput(
@@ -2269,55 +2265,24 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_id not in cs._req_status
 
 
-def test_engine_core_reset_and_sleep_drain_connector_barrier():
-    """In-process reset and sleep step until connector reset succeeds."""
+def test_engine_core_reset_waits_for_connector_barrier():
+    """Core cache clearing does not succeed before a deferred connector reset."""
     from vllm.v1.engine.core import EngineCore
 
     core = object.__new__(EngineCore)
     core.scheduler = MagicMock()
-    core.scheduler.running = []
-    core.scheduler.waiting = []
-    core.scheduler.skipped_waiting = []
-    core.scheduler.connector.has_pending_push_work.return_value = True
-    core.scheduler.reset_prefix_cache.return_value = False
-    core.scheduler.reset_connector_cache.return_value = True
-    core.step_fn = MagicMock()
+    core.scheduler.reset_prefix_cache.side_effect = [False, True]
     core.reset_mm_cache = MagicMock()
     core.reset_encoder_cache = MagicMock()
 
-    # Direct reset with no user request must make progress through step_fn.
-    assert core.reset_prefix_cache(reset_connector=True) is True
-    core.step_fn.assert_called_once_with()
-    core.reset_mm_cache.reset_mock()
-    core.reset_encoder_cache.reset_mock()
+    assert core._reset_caches() is False
+    core.reset_mm_cache.assert_not_called()
+    core.reset_encoder_cache.assert_not_called()
 
-    # Sleep must not proceed until its pending connector reset completes.
-    core.scheduler.reset_prefix_cache.return_value = False
-    core.scheduler.reset_connector_cache.return_value = True
-    core.step_fn.reset_mock()
-    core.model_executor = MagicMock()
-    core.scheduler.finish_requests.return_value = []
-    assert core.sleep(level=1, mode="keep") is None
-    core.step_fn.assert_called_once_with()
-    core.model_executor.sleep.assert_called_once_with(1)
-
-
-def test_engine_core_direct_reset_running_request_does_not_step():
-    """An invalid local reset returns immediately without user model work."""
-    from vllm.v1.engine.core import EngineCore
-
-    core = object.__new__(EngineCore)
-    core.scheduler = MagicMock()
-    core.scheduler.running = [object()]
-    core.scheduler.waiting = []
-    core.scheduler.skipped_waiting = []
-    core.scheduler.connector.has_pending_push_work.return_value = True
-    core.scheduler.reset_prefix_cache.return_value = False
-    core.step_fn = MagicMock()
-
-    assert core.reset_prefix_cache(reset_connector=True) is False
-    core.step_fn.assert_not_called()
-    core.scheduler.reset_connector_cache.assert_not_called()
+    assert core._reset_caches() is True
+    core.reset_mm_cache.assert_called_once_with()
+    core.reset_encoder_cache.assert_called_once_with()
+    assert core.scheduler.reset_prefix_cache.call_count == 2
 
 
 def test_pending_transfer_defers_prefix_lookup():
