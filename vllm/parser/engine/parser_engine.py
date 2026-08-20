@@ -54,6 +54,7 @@ class ToolCallSlot:
         "name_sent",
         "string_keys",
         "streamed_json",
+        "invalid",
     )
 
     def __init__(self) -> None:
@@ -64,6 +65,7 @@ class ToolCallSlot:
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
         self.streamed_json: str = ""
+        self.invalid: bool = False
 
     @property
     def args(self) -> str:
@@ -196,11 +198,52 @@ class ParserEngine(Parser):
         """
         return self.is_reasoning_end(list(input_ids))
 
-    def finish_streaming(self) -> DeltaMessage | None:
+    def _before_finish(self) -> None:
+        """Allow parser-specific recovery before the engine auto-closes."""
+        return
+
+    def _after_finish(self, delta: DeltaMessage | None) -> DeltaMessage | None:
+        """Allow parser-specific recovery after the engine has been flushed."""
+        return delta
+
+    def _merge_deltas(
+        self,
+        first: DeltaMessage | None,
+        second: DeltaMessage | None,
+    ) -> DeltaMessage | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+
+        invalid_indices = {
+            idx for idx, slot in enumerate(self._tool_slots) if slot.invalid
+        }
+        first_tool_calls = [
+            tc for tc in first.tool_calls if tc.index not in invalid_indices
+        ]
+        tool_calls = first_tool_calls + second.tool_calls
+        if len(tool_calls) > 1:
+            tool_calls = self._coalesce_tool_call_deltas(tool_calls)
+        return DeltaMessage(
+            content=(first.content or "") + (second.content or "") or None,
+            reasoning=(first.reasoning or "") + (second.reasoning or "") or None,
+            tool_calls=tool_calls,
+        )
+
+    def _finish_streaming_delta(self) -> DeltaMessage | None:
+        self._before_finish()
         events = self._engine.finish()
-        if events or self._deferred_content:
-            return self._events_to_delta(events, finished=True)
-        return None
+        delta = self._events_to_delta(events, finished=True)
+        if self._deferred_content:
+            delta = self._merge_deltas(
+                delta,
+                self._events_to_delta([], finished=True),
+            )
+        return self._after_finish(delta)
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        return self._finish_streaming_delta()
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         self._engine.reset(initial_state=initial_state)
@@ -455,9 +498,9 @@ class ParserEngine(Parser):
             self._prompt_streaming_prepared = True
         self._check_skip_tool_parsing(request)
         events = self._feed(delta_text, delta_token_ids)
-        if finished:
-            events.extend(self._engine.finish())
         result = self._events_to_delta(events, finished=finished)
+        if finished:
+            result = self._merge_deltas(result, self._finish_streaming_delta())
         result = self._strip_trailing_reasoning(result)
 
         # Suppress reasoning deltas if not requested
@@ -667,11 +710,9 @@ class ParserEngine(Parser):
         state that ``_build_extracted_result`` reads.
         """
         self._reset(initial_state=initial_state)
-        events = self._feed(text, token_ids)
-        events.extend(self._engine.finish())
-
-        delta = self._events_to_delta(events, finished=True)
-        tool_call_info = self._build_extracted_result()
+        delta = self._events_to_delta(self._feed(text, token_ids), finished=False)
+        delta = self._merge_deltas(delta, self._finish_streaming_delta())
+        tool_call_info = self._build_extracted_result(delta)
 
         reasoning = delta.reasoning if delta else None
         if reasoning and self._strip_trailing_reasoning_ws:
@@ -1057,7 +1098,7 @@ class ParserEngine(Parser):
             else:
                 args_json = "{}"
 
-            if self._accept_tool_name(name):
+            if slot.invalid or self._accept_tool_name(name):
                 self._ensure_tool_id(slot, name)
                 args_json = self._fix_arg_types(args_json, name)
                 tool_calls.append(

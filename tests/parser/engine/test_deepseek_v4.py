@@ -29,6 +29,7 @@ from vllm.parser.deepseek_v4 import (
     DSML_THINK_START,
     DSML_TOOL_END,
     DSML_TOOL_START,
+    INVALID_DSML_TOOL_NAME,
     DeepSeekV4Parser,
     _dsml_arg_converter,
     _unwrap_wrapper_args,
@@ -247,7 +248,7 @@ class TestMissingInvokeEnd:
     def test_unknown_tool_is_recoverable_invalid_tool_call(
         self, mock_tokenizer, mock_request
     ):
-        tools = _GET_WEATHER_TOOLS
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
         parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
         mock_request.tools = tools
         text = _tool_calls(
@@ -265,10 +266,40 @@ class TestMissingInvokeEnd:
             "tool_name": "missing_tool",
         }
 
+    def test_valid_name_truncated_at_eos_is_invalid(self, mock_tokenizer, mock_request):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        text = DSML_TOOL_START + _invoke(
+            "get_weather", ("location", "true", "NYC")
+        ).replace(DSML_INVOKE_END, "")
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tool_call = result.tool_calls[0]
+        assert tool_call.function.name not in {tool.function.name for tool in tools}
+        assert json.loads(tool_call.function.arguments)["tool_name"] == "get_weather"
+
+    def test_empty_name_truncated_at_eos_is_invalid(self, mock_tokenizer, mock_request):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        text = DSML_TOOL_START + DSML_INVOKE_PREFIX
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tool_call = result.tool_calls[0]
+        assert tool_call.function.name not in {tool.function.name for tool in tools}
+        assert "tool_name" not in json.loads(tool_call.function.arguments)
+
     def test_truncated_tool_prefix_is_recoverable_invalid_tool_call(
         self, mock_tokenizer, mock_request
     ):
-        tools = _GET_WEATHER_TOOLS
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
         parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
         mock_request.tools = tools
 
@@ -284,9 +315,115 @@ class TestMissingInvokeEnd:
                 "retry the intended call."
             )
         }
+        assert tool_call.function.name not in {tool.function.name for tool in tools}
+
+    def test_sentinel_collision_uses_unrequested_name_and_valid_sentinel_call_survives(
+        self, mock_tokenizer, mock_request
+    ):
+        sentinel_tool = _make_tool(
+            INVALID_DSML_TOOL_NAME, {"value": {"type": "string"}}
+        )
+        tools = [sentinel_tool]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+
+        invalid = parser.extract_tool_calls(
+            _tool_calls(_invoke("missing_tool", ("value", "true", "bad"))),
+            mock_request,
+        )
+        valid = parser.extract_tool_calls(
+            _tool_calls(_invoke(INVALID_DSML_TOOL_NAME, ("value", "true", "good"))),
+            mock_request,
+        )
+
+        invalid_call = invalid.tool_calls[0]
+        assert invalid_call.function.name not in {tool.function.name for tool in tools}
+        assert invalid_call.function.name.startswith(INVALID_DSML_TOOL_NAME)
+        assert valid.tool_calls[0].function.name == INVALID_DSML_TOOL_NAME
+        assert json.loads(valid.tool_calls[0].function.arguments) == {"value": "good"}
+
+    def test_parse_direct_recovers_truncated_prefix(self, mock_tokenizer, mock_request):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+
+        _, _, tool_calls = parser.parse(DSML_TOOL_START, mock_request)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name not in {tool.function.name for tool in tools}
+
+    def test_parse_delta_finished_recovers_truncated_prefix(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+
+        delta = parser.parse_delta(DSML_TOOL_START, [], mock_request, finished=True)
+
+        assert delta is not None
+        assert delta.tool_calls[0].function.name not in {
+            tool.function.name for tool in tools
+        }
+
+    def test_streaming_final_recovers_lexical_partial_prefix(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        partial = DSML_TOOL_START[:-3]
+
+        assert parser.parse_delta(partial, [], mock_request, finished=False) is None
+        delta = parser.parse_delta("", [], mock_request, finished=True)
+
+        assert delta is not None
+        assert delta.tool_calls[0].function.name not in {
+            tool.function.name for tool in tools
+        }
+
+    def test_finish_recovery_preserves_adjacent_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        text = (
+            _tool_calls(
+                _invoke("get_weather", ("location", "true", "NYC")),
+            )
+            + "Done."
+        )
+
+        delta = parser.parse_delta(text, [], mock_request, finished=True)
+
+        assert delta is not None
+        assert delta.content == "Done."
+        assert delta.tool_calls[0].function.name == "get_weather"
 
 
 # ── Thinking mode initial state ──────────────────────────────────────
+
+
+class TestAdapterFinishRecovery:
+    def test_adapter_non_streaming_recovers_valid_name_truncation(
+        self, mock_tokenizer, mock_request
+    ):
+        tools = [_make_tool("get_weather", {"location": {"type": "string"}})]
+        adapter = DeepSeekV4ParserToolAdapter(mock_tokenizer, tools=tools)
+        mock_request.tools = tools
+        text = DSML_TOOL_START + _invoke(
+            "get_weather", ("location", "true", "NYC")
+        ).replace(DSML_INVOKE_END, "")
+
+        result = adapter.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name not in {
+            tool.function.name for tool in tools
+        }
 
 
 class TestThinkingModeConfig:

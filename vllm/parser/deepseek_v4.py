@@ -357,10 +357,16 @@ class DeepSeekV4Parser(ParserEngine):
         )
         self._arg_converter = self._convert_args
         self._pending_stray_tool_framing: str | None = None
+        self._invalid_tool_names: set[str] = set()
+        self._finish_invalid_slot: int | None = None
+        self._finish_invalid_prefix: str | None = None
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         super()._reset(initial_state=initial_state)
         self._pending_stray_tool_framing = None
+        self._invalid_tool_names.clear()
+        self._finish_invalid_slot = None
+        self._finish_invalid_prefix = None
 
     @staticmethod
     def _invalid_tool_arguments(
@@ -372,10 +378,24 @@ class DeepSeekV4Parser(ParserEngine):
             arguments["tool_name"] = attempted_name
         return json.dumps(arguments, ensure_ascii=False)
 
+    def _choose_invalid_tool_name(self) -> str:
+        candidate = INVALID_DSML_TOOL_NAME
+        suffix = 0
+        while candidate in self._invalid_tool_names or find_tool_name(
+            self._tools, candidate
+        ):
+            suffix += 1
+            candidate = f"{INVALID_DSML_TOOL_NAME}_{suffix}"
+        self._invalid_tool_names.add(candidate)
+        return candidate
+
     def _mark_invalid_tool_slot(self, idx: int, message: str) -> None:
         slot = self._tool_slots[idx]
+        if slot.invalid:
+            return
         attempted_name = slot.name
-        slot.name = INVALID_DSML_TOOL_NAME
+        slot.name = self._choose_invalid_tool_name()
+        slot.invalid = True
         slot.name_sent = False
         slot.string_keys = None
         slot._args_parts[:] = [self._invalid_tool_arguments(message, attempted_name)]
@@ -383,53 +403,114 @@ class DeepSeekV4Parser(ParserEngine):
         slot.streamed_json = ""
 
     def _accept_tool_name(self, name: str) -> bool:
-        if name == INVALID_DSML_TOOL_NAME:
+        if name in self._invalid_tool_names:
             return True
         return super()._accept_tool_name(name)
 
-    def finish_streaming(self) -> DeltaMessage | None:
-        incomplete_tool_preamble = self._engine.state == ParserState.TOOL_PREAMBLE
-        delta = super().finish_streaming()
-        pending = self._pending_stray_tool_framing
-        if delta is None and (pending is not None or incomplete_tool_preamble):
-            from vllm.entrypoints.openai.engine.protocol import (
-                DeltaFunctionCall,
-                DeltaMessage,
-                DeltaToolCall,
-            )
+    @staticmethod
+    def _partial_dsml_start(text: str | None) -> str | None:
+        if not text:
+            return None
+        stripped = text.lstrip()
+        if len(stripped) < 2:
+            return None
+        for terminal in (DSML_TOOL_START, DSML_INVOKE_PREFIX):
+            if terminal.startswith(stripped):
+                return text
+        return None
 
-            self._pending_stray_tool_framing = None
-            if incomplete_tool_preamble or (pending is not None and _DSML in pending):
-                # A terminal DSML namespace prefix is an attempted tool call,
-                # not assistant content. Surface a safe unknown tool so the
-                # client can return an error and let the model retry instead
-                # of silently ending the agent turn or leaking raw framing.
-                idx = len(self._tool_slots)
+    def _before_finish(self) -> None:
+        self._finish_invalid_slot = None
+        self._finish_invalid_prefix = None
+        if self.skip_tool_parsing:
+            return
+        state = self._engine.state
+        if state in (ParserState.TOOL_NAME, ParserState.TOOL_ARGS):
+            idx = self._engine.tool_index
+            if idx >= 0:
                 self._ensure_slot(idx)
                 self._mark_invalid_tool_slot(
                     idx,
-                    "The model ended after an incomplete tool-call prefix; "
+                    "The model ended during an incomplete tool call; "
                     "retry the intended call.",
                 )
-                slot = self._tool_slots[idx]
-                slot.name_sent = True
-                self._ensure_tool_id(slot, INVALID_DSML_TOOL_NAME)
-                delta = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=idx,
-                            id=slot.id,
-                            type="function",
-                            function=DeltaFunctionCall(
-                                name=INVALID_DSML_TOOL_NAME,
-                                arguments=slot.args,
-                            ),
-                        )
-                    ]
+                self._finish_invalid_slot = idx
+                return
+
+        if state == ParserState.TOOL_PREAMBLE:
+            self._finish_invalid_prefix = DSML_TOOL_START
+            return
+
+        self._finish_invalid_prefix = self._partial_dsml_start(
+            self._engine._lexer.buffer
+        )
+        if self._finish_invalid_prefix is None:
+            self._finish_invalid_prefix = self._partial_dsml_start(
+                self._pending_stray_tool_framing
+            )
+
+    @staticmethod
+    def _delta_has_tool_index(delta: DeltaMessage | None, idx: int) -> bool:
+        return bool(delta and any(tc.index == idx for tc in delta.tool_calls))
+
+    def _make_invalid_tool_delta(self, idx: int) -> DeltaMessage:
+        from vllm.entrypoints.openai.engine.protocol import (
+            DeltaFunctionCall,
+            DeltaMessage,
+            DeltaToolCall,
+        )
+
+        slot = self._tool_slots[idx]
+        slot.name_sent = True
+        self._ensure_tool_id(slot, slot.name)
+        return DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=idx,
+                    id=slot.id,
+                    type="function",
+                    function=DeltaFunctionCall(
+                        name=slot.name,
+                        arguments=slot.args,
+                    ),
                 )
-            else:
-                delta = DeltaMessage(content=pending)
-        return delta
+            ]
+        )
+
+    def _after_finish(self, delta: DeltaMessage | None) -> DeltaMessage | None:
+        invalid_slot = self._finish_invalid_slot
+        invalid_prefix = self._finish_invalid_prefix
+        self._finish_invalid_slot = None
+        self._finish_invalid_prefix = None
+        self._pending_stray_tool_framing = None
+
+        if invalid_slot is not None:
+            if not self._delta_has_tool_index(delta, invalid_slot):
+                delta = self._merge_deltas(
+                    delta,
+                    self._make_invalid_tool_delta(invalid_slot),
+                )
+            return delta
+
+        if invalid_prefix is None:
+            return delta
+
+        idx = len(self._tool_slots)
+        self._ensure_slot(idx)
+        self._mark_invalid_tool_slot(
+            idx,
+            "The model ended after an incomplete tool-call prefix; "
+            "retry the intended call.",
+        )
+        if delta is not None and delta.content:
+            escaped_prefix = _escape_unparsed_dsml(invalid_prefix)
+            content = delta.content
+            if content.endswith(escaped_prefix):
+                content = content[: -len(escaped_prefix)]
+            elif content.endswith(invalid_prefix):
+                content = content[: -len(invalid_prefix)]
+            delta.content = content or None
+        return self._merge_deltas(delta, self._make_invalid_tool_delta(idx))
 
     def extract_reasoning(
         self,
@@ -524,7 +605,12 @@ class DeepSeekV4Parser(ParserEngine):
         if idx < 0 or idx >= len(self._tool_slots):
             return
         slot = self._tool_slots[idx]
-        if slot.name_sent or not slot.name or find_tool_name(self._tools, slot.name):
+        if (
+            slot.invalid
+            or slot.name_sent
+            or not slot.name
+            or find_tool_name(self._tools, slot.name)
+        ):
             return
 
         candidate, swallowed = _malformed_name_candidate(slot.name)
@@ -551,6 +637,7 @@ class DeepSeekV4Parser(ParserEngine):
         if (
             self._tools
             and idx < len(self._tool_slots)
+            and not self._tool_slots[idx].invalid
             and self._tool_slots[idx].name
             and not find_tool_name(self._tools, self._tool_slots[idx].name)
         ):
@@ -562,7 +649,7 @@ class DeepSeekV4Parser(ParserEngine):
 
     def _convert_args_for_slot(self, idx: int, partial: bool) -> str:
         slot = self._tool_slots[idx]
-        if slot.name == INVALID_DSML_TOOL_NAME:
+        if slot.invalid:
             return slot.args or "{}"
         return self._convert_args(slot.args, partial, slot.name)
 
