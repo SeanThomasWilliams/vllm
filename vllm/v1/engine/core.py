@@ -812,9 +812,25 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
+        reset_successful = self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+        if (
+            type(self) is EngineCore
+            and not reset_successful
+            and reset_connector
+            and self.scheduler.connector is not None
+            and self.scheduler.connector.has_pending_push_work()
+        ):
+            # In-process clients only advance the connector when their caller
+            # steps the engine. Drain connector-only reset work here so a direct
+            # reset or sleep cannot leave the scheduler paused indefinitely.
+            while not reset_successful:
+                self.step_fn()
+                reset_successful = self.scheduler.reset_prefix_cache(
+                    False, reset_connector
+                )
+        return reset_successful
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
