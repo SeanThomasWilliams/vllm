@@ -2265,24 +2265,32 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_id not in cs._req_status
 
 
-def test_engine_core_reset_waits_for_connector_barrier():
-    """Core cache clearing does not succeed before a deferred connector reset."""
+def test_engine_core_reset_and_sleep_drain_connector_barrier():
+    """In-process reset and sleep step until connector reset succeeds."""
     from vllm.v1.engine.core import EngineCore
 
     core = object.__new__(EngineCore)
     core.scheduler = MagicMock()
+    core.scheduler.connector.has_pending_push_work.return_value = True
     core.scheduler.reset_prefix_cache.side_effect = [False, True]
+    core.step_fn = MagicMock()
     core.reset_mm_cache = MagicMock()
     core.reset_encoder_cache = MagicMock()
 
-    assert core._reset_caches() is False
-    core.reset_mm_cache.assert_not_called()
-    core.reset_encoder_cache.assert_not_called()
+    # Direct reset with no user request must make progress through step_fn.
+    assert core.reset_prefix_cache(reset_connector=True) is True
+    core.step_fn.assert_called_once_with()
+    core.reset_mm_cache.reset_mock()
+    core.reset_encoder_cache.reset_mock()
 
-    assert core._reset_caches() is True
-    core.reset_mm_cache.assert_called_once_with()
-    core.reset_encoder_cache.assert_called_once_with()
-    assert core.scheduler.reset_prefix_cache.call_count == 2
+    # Sleep must not proceed until its pending connector reset completes.
+    core.scheduler.reset_prefix_cache.side_effect = [False, True]
+    core.step_fn.reset_mock()
+    core.model_executor = MagicMock()
+    core.scheduler.finish_requests.return_value = []
+    assert core.sleep(level=1, mode="keep") is None
+    core.step_fn.assert_called_once_with()
+    core.model_executor.sleep.assert_called_once_with(1)
 
 
 def test_pending_transfer_defers_prefix_lookup():
